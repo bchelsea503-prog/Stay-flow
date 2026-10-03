@@ -78,9 +78,19 @@ test('full workflow with role enforcement', async () => {
   assert.equal(mine.length, 2);
   const a = mine[0];
 
-  // must clock in first
+  // must sign the acknowledgment, then clock in, before working rooms
   assert.equal((await e.post(`/api/assignments/${a.id}/start`)).status, 409);
+  assert.equal((await e.post('/api/clock/in')).status, 409, 'acknowledgment required');
+  assert.equal((await e.post('/api/ack', { name: 'Someone Else', agree: true })).status, 400);
+  assert.equal((await e.post('/api/ack', { name: 'mia', agree: false })).status, 400);
+  assert.equal((await e.post('/api/ack', { name: ' MIA ', agree: true })).status, 200);
   assert.equal((await e.post('/api/clock/in')).status, 200);
+  // breaks
+  assert.equal((await e.post('/api/clock/break/end')).status, 409);
+  assert.equal((await e.post('/api/clock/break/start')).status, 200);
+  assert.equal((await e.post('/api/clock/break/start')).status, 409);
+  assert.equal((await e.get('/api/clock/status')).data.break.on_break, true);
+  assert.equal((await e.post('/api/clock/break/end')).status, 200);
   assert.equal((await e.post('/api/clock/in')).status, 409);
   assert.equal((await e.post(`/api/assignments/${a.id}/start`)).status, 200);
 
@@ -112,8 +122,12 @@ test('full workflow with role enforcement', async () => {
 
   // reject then approve
   assert.equal((await m.post(`/api/assignments/${a.id}/review`, { approve: false })).status, 400);
-  assert.equal((await m.post(`/api/assignments/${a.id}/review`, { approve: false, note: 'Mirror streaky' })).status, 200);
-  assert.equal((await e.get(`/api/assignments/${a.id}`)).data.status, 'rejected');
+  assert.equal((await m.post(`/api/assignments/${a.id}/review`, { approve: false, note: 'Mirror streaky', failed_items: [detail.items[0].item_id] })).status, 200);
+  const redo = (await e.get(`/api/assignments/${a.id}`)).data;
+  assert.equal(redo.status, 'rejected');
+  assert.equal(redo.items.filter((i) => !i.done).length, 1, 'missed step must be redone');
+  assert.equal((await e.post(`/api/assignments/${a.id}/submit`, {})).status, 400, 'cannot resubmit until redone');
+  await e.put(`/api/assignments/${a.id}/check`, { item_id: detail.items[0].item_id, done: true });
   assert.equal((await e.post(`/api/assignments/${a.id}/submit`, {})).status, 200);
   assert.equal((await m.post(`/api/assignments/${a.id}/review`, { approve: true })).status, 200);
   assert.equal((await o.get('/api/rooms')).data.find((r) => r.id === a.room_id).status, 'clean');
@@ -143,11 +157,63 @@ test('full workflow with role enforcement', async () => {
   const inv = await m.post('/api/inventory', { name: 'Towels', qty: 10, par: 20 });
   assert.equal((await m.post(`/api/inventory/${inv.data.id}/adjust`, { delta: -3, note: 'laundry loss' })).status, 200);
   assert.equal((await m.post(`/api/inventory/${inv.data.id}/adjust`, { delta: -30 })).status, 400);
+  assert.equal((await o.patch(`/api/inventory/${inv.data.id}`, { par: 20 })).status, 200, 'owner sets par');
   const dash = (await o.get('/api/dashboard')).data;
   assert.equal(dash.lowStock.length, 1);
   assert.equal(dash.lowStock[0].qty, 7);
   assert.ok(dash.activity.length > 5);
   assert.equal((await m.get('/api/dashboard')).data.activity, undefined);
+
+  // owner-only standards
+  assert.equal((await m.post('/api/checklist', { text: 'x' })).status, 403);
+  assert.equal((await o.post('/api/checklist', { text: 'Wipe baseboards', section: 'Bedroom' })).status, 200);
+  assert.equal((await m.patch(`/api/inventory/${inv.data.id}`, { par: 99 })).status, 200);
+  assert.equal((await o.get('/api/inventory')).data[0].par, 20, 'manager cannot change par');
+
+  // timecard corrections need a reason, keep the original, and are never hard-deleted
+  const ents = (await m.get('/api/clock/entries')).data;
+  assert.equal(ents.length, 1);
+  assert.equal((await m.patch(`/api/clock/entries/${ents[0].id}`, { clock_in: ents[0].clock_in })).status, 400);
+  const newIn = new Date(Date.parse(ents[0].clock_in) - 3600000).toISOString();
+  assert.equal((await m.patch(`/api/clock/entries/${ents[0].id}`, { clock_in: newIn, reason: 'Forgot to clock in' })).status, 200);
+  const hist = (await m.get(`/api/clock/entries/${ents[0].id}/history`)).data;
+  assert.equal(hist[0].old_in, ents[0].clock_in);
+  assert.equal(hist[0].new_in, newIn);
+  assert.equal((await m.del(`/api/clock/entries/${ents[0].id}`)).status, 404, 'no delete endpoint');
+  assert.equal((await m.post(`/api/clock/entries/${ents[0].id}/void`, {})).status, 400);
+
+  // accountability: one warning, then the repeat is flagged; record is permanent
+  const w1 = await m.post('/api/accountability', { user_id: miaId, kind: 'warning', category: 'missed cleaning step', description: 'Skipped under-bed check in 102' });
+  assert.equal(w1.status, 200);
+  assert.equal(w1.data.repeat, false);
+  const w2 = await m.post('/api/accountability', { user_id: miaId, kind: 'warning', category: 'missed cleaning step', description: 'Skipped under-bed check again' });
+  assert.equal(w2.data.repeat, true);
+  assert.equal((await m.post('/api/accountability', { user_id: miaId, kind: 'warning', description: 'x' })).status, 400, 'needs description');
+  assert.equal((await m.post(`/api/accountability/${w1.data.id}/retract`, { reason: 'oops' })).status, 403, 'only owner retracts');
+  assert.equal((await e.get('/api/accountability?user_id=' + miaId)).status, 403);
+  assert.equal((await e.get('/api/me/accountability')).data.events.length, 2, 'employee sees own record');
+  assert.equal((await z.get('/api/me/accountability')).data.events.length, 0);
+
+  // incidents: any staff can file; urgent ones raise an alert for managers
+  assert.equal((await z.post('/api/incidents', { category: 'bogus', description: 'x' })).status, 400);
+  const inc = await z.post('/api/incidents', { category: 'harassment', description: 'Guest in 104 shouting at me' });
+  assert.equal(inc.data.urgent, 1);
+  const badges = (await m.get("/api/badges")).data;
+  assert.equal(badges.alerts.length, 1);
+  assert.equal((await z.get('/api/badges')).data.alerts, undefined);
+  assert.equal((await m.post(`/api/incidents/${inc.data.id}/review`, { note: 'Spoke with guest' })).status, 200);
+  assert.equal((await m.get('/api/badges')).data.alerts.length, 0);
+
+  // reporting gap flag is manager-only
+  const gapReq = await e.form('/api/maintenance', photoForm({ title: 'Dripping tap', reporting_gap: '1' }));
+  assert.equal((await o.get('/api/maintenance/' + gapReq.data.id)).data.reporting_gap, 0);
+  const mgrReq = await m.form('/api/maintenance', photoForm({ title: 'Guest found broken lock', reporting_gap: '1' }));
+  assert.equal((await o.get('/api/maintenance/' + mgrReq.data.id)).data.reporting_gap, 1);
+
+  const dash2 = (await o.get('/api/dashboard')).data;
+  assert.ok(dash2.attention.some((x) => x.type === 'gap'));
+  assert.ok(dash2.deepDue.length > 0);
+  assert.ok((await o.get('/api/employees/' + miaId + '/timeline')).data.events.length === 2);
 
   // deactivated users lose access immediately
   assert.equal((await o.patch(`/api/users/${miaId}`, { active: false })).status, 200);

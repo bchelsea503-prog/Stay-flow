@@ -1,5 +1,6 @@
 import { S, h, GET, POST } from './util.js';
-import { clockView, roomView, chatView, maintListView, maintNewView, maintDetailView, accountView } from './views-common.js';
+import { clockView, roomView, chatView, maintListView, maintNewView, maintDetailView } from './views-common.js';
+import { playbookView, incidentNewView, incidentsView, employeeView, accountView } from './views-people.js';
 import { myRoomsView } from './views-staff.js';
 import {
   homeView, roomsBoardView, roomListView, hoursView, inventoryView, teamView, checklistView, settingsView,
@@ -25,6 +26,10 @@ const routes = [
   { path: 'chat', roles: ALL, view: chatView },
   { path: 'maint', roles: ALL, view: (r, p) => (p[0] === 'new' ? maintNewView(r, p) : p[0] ? maintDetailView(r, p) : maintListView(r, p)) },
   { path: 'account', roles: ALL, view: accountView },
+  { path: 'playbook', roles: ALL, view: playbookView },
+  { path: 'incident', roles: ALL, view: incidentNewView },
+  { path: 'incidents', roles: MGR, view: incidentsView },
+  { path: 'employee', roles: MGR, view: employeeView },
   { path: 'more', roles: MGR, view: moreView },
 ];
 
@@ -37,7 +42,8 @@ const NAV = {
     { to: 'home', icon: '📊', label: 'Home' }, { to: 'rooms', icon: '🛏️', label: 'Rooms', badge: 'review' },
     { to: 'hours', icon: '⏱️', label: 'Hours', desk: true }, { to: 'inventory', icon: '📦', label: 'Inventory', desk: true },
     { to: 'chat', icon: '💬', label: 'Chat', badge: 'chat' }, { to: 'maint', icon: '🔧', label: 'Repairs', badge: 'maintenance' },
-    { to: 'team', icon: '👥', label: 'Team', desk: true }, { to: 'checklist', icon: '✅', label: 'Checklist', desk: true },
+    { to: 'incidents', icon: '🚨', label: 'Incidents', desk: true, badge: 'incidents' },
+    { to: 'team', icon: '👥', label: 'Team', desk: true }, { to: 'checklist', icon: '✅', label: 'Standard', desk: true },
     { to: 'more', icon: '☰', label: 'More', mobile: true },
   ],
 };
@@ -45,7 +51,7 @@ NAV.owner = [...NAV.manager.slice(0, -1), { to: 'settings', icon: '⚙️', labe
 
 async function moreView(root) {
   const items = [
-    ['hours', '⏱️ Hours & payroll'], ['inventory', '📦 Inventory'], ['team', '👥 Team'], ['checklist', '✅ Cleaning checklist'],
+    ['hours', '⏱️ Hours & payroll'], ['inventory', '📦 Inventory'], ['incidents', '🚨 Incident reports'], ['team', '👥 Team & accountability'], ['checklist', '✅ Room cleaning standard'], ['playbook', '📘 SOP Playbook'],
     ['roomlist', '🚪 Room list'], S.me.role === 'owner' && ['settings', '⚙️ Settings'], ['account', '👤 My account'],
   ].filter(Boolean);
   root.append(h('h2', null, 'More'), h('ul', { class: 'cards' }, items.map(([to, label]) => h('li', null, h('a', { class: 'card link', href: '#/' + to }, label)))));
@@ -92,9 +98,18 @@ function drawNav(active) {
   }));
 }
 
+const ALERT_LABEL = { violence: 'Violence', threat: 'Threat', harassment: 'Harassment', intoxication: 'Intoxication', theft: 'Theft', safety: 'Safety' };
+function drawAlerts() {
+  const box = document.getElementById('alerts');
+  if (!box) return;
+  const list = S.badges.alerts || [];
+  box.replaceChildren(...list.map((a) => h('a', { class: 'alert-banner', href: '#/incidents' },
+    `🚨 URGENT: ${ALERT_LABEL[a.category] || a.category} reported by ${a.reporter}${a.room ? ' (Room ' + a.room + ')' : ''}. Tap to review.`)));
+}
+
 async function refreshBadges() {
   if (!S.me) return;
-  try { S.badges = await GET('/api/badges'); drawNav(parseHash().name); } catch { /* offline */ }
+  try { S.badges = await GET('/api/badges'); drawNav(parseHash().name); drawAlerts(); } catch { /* offline */ }
 }
 
 // ---------- login ----------
@@ -118,7 +133,8 @@ function showLogin(message) {
 function shell() {
   app.replaceChildren(
     h('header', { class: 'top' }, h('span', { class: 'brand' }, '🌊 ', S.settings.property_name),
-      h('span', { class: 'who' }, S.me.name, ' · ', S.me.role)),
+      h('span', { class: 'who' }, S.me.name, ' · ', S.me.role), h('a', { class: 'report-btn', href: '#/incident/new' }, '🚨 Report')),
+    h('div', { id: 'alerts', role: 'alert' }),
     h('nav', { id: 'nav', 'aria-label': 'Main' }),
     h('main', { class: 'view', id: 'view' }));
 }
@@ -136,7 +152,7 @@ async function start() {
   if (!started) {
     started = true;
     window.addEventListener('hashchange', render);
-    setInterval(refreshBadges, 20000);
+    setInterval(refreshBadges, 10000);
     document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && refreshBadges());
     window.addEventListener('sf-badges', refreshBadges);
   }

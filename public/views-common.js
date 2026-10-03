@@ -14,15 +14,26 @@ export async function clockCard(onChange) {
     const st = await GET('/api/clock/status');
     card.replaceChildren();
     if (st.open) {
-      const timer = h('div', { class: 'big-time' }, duration(st.open.clock_in));
-      tick = setInterval(() => { if (!card.isConnected) return clearInterval(tick); timer.textContent = duration(st.open.clock_in); }, 15000);
+      const onBreak = st.break?.on_break;
+      const stamp = onBreak ? st.break.since : st.open.clock_in;
+      const timer = h('div', { class: 'big-time' }, duration(stamp));
+      tick = setInterval(() => { if (!card.isConnected) return clearInterval(tick); timer.textContent = duration(stamp); }, 15000);
       card.append(
-        h('div', { class: 'row between' }, h('div', null, pill('ok', 'Clocked in'), h('div', { class: 'muted' }, 'Since ' + fmtTime(st.open.clock_in))), timer),
-        h('button', { class: 'btn big danger', onclick: () => out(false) }, 'Clock out')
+        h('div', { class: 'row between' },
+          h('div', null, onBreak ? pill('warn', 'On break') : pill('ok', 'Clocked in'),
+            h('div', { class: 'muted' }, onBreak ? 'Break started ' + fmtTime(st.break.since) : 'Since ' + fmtTime(st.open.clock_in)),
+            st.break.minutes_today > 0 && !onBreak && h('div', { class: 'muted small' }, `Breaks today: ${st.break.minutes_today} min`)),
+          timer),
+        h('div', { class: 'row' },
+          h('button', { class: 'btn big grow ' + (onBreak ? 'primary' : ''), onclick: async () => {
+            if (await attempt(() => POST(onBreak ? '/api/clock/break/end' : '/api/clock/break/start'), onBreak ? 'Welcome back' : 'Break started')) { await render(); onChange?.(); }
+          } }, onBreak ? 'End break' : 'Start break'),
+          h('button', { class: 'btn big grow danger', onclick: () => out(false) }, 'Clock out'))
       );
     } else {
       card.append(
         h('div', { class: 'row between' }, h('div', null, pill('', 'Clocked out'), h('div', { class: 'muted' }, `Today: ${st.today_hours.toFixed(2)} hrs`))),
+        st.needs_ack && h('div', { class: 'note bad' }, 'Before your first shift you need to read and sign the Employee Acknowledgment. ', h('a', { href: '#/playbook' }, 'Open it now')),
         h('button', { class: 'btn big primary', onclick: async () => { if (await attempt(() => POST('/api/clock/in'), 'Clocked in')) { await render(); onChange?.(); } } }, 'Clock in')
       );
     }
@@ -67,7 +78,8 @@ export async function roomView(root, [id]) {
     h('div', { class: 'row between' },
       h('h2', null, `Room ${a.room_number}`),
       pill(a.status, ASSIGN_LABEL[a.status])),
-    h('p', { class: 'muted' }, `${a.clean_type === 'stayover' ? 'Stayover' : a.clean_type === 'deep' ? 'Deep clean' : 'Checkout'} · ${a.user_name} · ${fmtDay(a.date)}`)
+    h('p', { class: 'muted' }, `${a.clean_type === 'stayover' ? 'Stayover' : a.clean_type === 'deep' ? 'Deep clean' : 'Checkout'} · ${a.user_name} · ${fmtDay(a.date)}${a.target_max ? ` · target ≤ ${a.target_max} min` : ''}`),
+    a.started_at && a.status === 'in_progress' && h('p', { class: 'muted small' }, `Started ${fmtTime(a.started_at)} (${duration(a.started_at)} ago). Quality always comes before speed.`)
   );
   if (a.room_notes) root.append(h('div', { class: 'note' }, '📌 ' + a.room_notes));
   if (a.status === 'rejected') root.append(h('div', { class: 'note bad' }, `Needs another pass${a.reviewer ? ' (' + a.reviewer + ')' : ''}: ${a.review_note}`));
@@ -81,16 +93,24 @@ export async function roomView(root, [id]) {
     bar.firstChild.style.width = (a.items.length ? (done() / a.items.length) * 100 : 0) + '%';
   };
 
-  const list = h('ul', { class: 'checks' }, a.items.map((it) => {
+  const review = isMgr() && a.status === 'submitted';
+  const missed = new Set();
+  const listBox = h('div');
+  let lastSection = null;
+  for (const it of a.items) {
+    if (it.section !== lastSection) { lastSection = it.section; listBox.append(h('h4', { class: 'sect' }, it.section || 'Tasks')); }
     const box = h('input', { type: 'checkbox', checked: !!it.done, disabled: !canEdit });
     box.addEventListener('change', async () => {
       const ok = await attempt(() => PUT(`/api/assignments/${a.id}/check`, { item_id: it.item_id, done: box.checked }));
       if (ok) { it.done = box.checked ? 1 : 0; updateProgress(); } else box.checked = !box.checked;
     });
-    return h('li', null, h('label', null, box, h('span', null, it.text)));
-  }));
+    const miss = review && h('input', { type: 'checkbox', class: 'miss', 'aria-label': 'Mark as missed: ' + it.text, onchange: (e) => (e.target.checked ? missed.add(it.item_id) : missed.delete(it.item_id)) });
+    listBox.append(h('div', { class: 'check-row' + (it.failed && a.status === 'rejected' ? ' failed' : '') },
+      h('label', null, box, h('span', null, it.text, it.failed && a.status === 'rejected' ? h('em', null, ' (missed, redo)') : null)),
+      review && h('label', { class: 'miss-label' }, miss, ' missed')));
+  }
   updateProgress();
-  root.append(h('section', { class: 'card' }, h('h3', null, 'Checklist'), progress, bar, list));
+  root.append(h('section', { class: 'card' }, h('h3', null, 'Checklist'), progress, bar, listBox));
 
   // photos
   const photoBox = h('div', { class: 'photos' });
@@ -128,12 +148,12 @@ export async function roomView(root, [id]) {
     root.append(h('section', { class: 'card' }, h('h3', null, 'Housekeeper notes'), h('p', null, a.notes)));
   }
 
-  if (isMgr() && a.status === 'submitted') {
-    const note = h('textarea', { rows: 2, placeholder: 'Feedback (required if sending back)', maxlength: 500 });
-    root.append(h('section', { class: 'card review' }, h('h3', null, 'Review'), note,
+  if (review) {
+    const note = h('textarea', { rows: 2, placeholder: 'Feedback (required if sending back). Tick any missed steps in the checklist above.', maxlength: 500 });
+    root.append(h('section', { class: 'card review' }, h('h3', null, 'Inspection'), note,
       h('div', { class: 'row' },
         h('button', { class: 'btn primary grow', onclick: async () => { if (await attempt(() => POST(`/api/assignments/${a.id}/review`, { approve: true, note: note.value }), 'Approved')) history.back(); } }, '✓ Approve'),
-        h('button', { class: 'btn danger grow', onclick: async () => { if (await attempt(() => POST(`/api/assignments/${a.id}/review`, { approve: false, note: note.value }), 'Sent back')) history.back(); } }, 'Send back'))));
+        h('button', { class: 'btn danger grow', onclick: async () => { if (await attempt(() => POST(`/api/assignments/${a.id}/review`, { approve: false, note: note.value, failed_items: [...missed] }), 'Sent back')) history.back(); } }, 'Send back for redo'))));
   }
   if (isMgr() && a.status !== 'approved') {
     root.append(h('button', { class: 'btn ghost block', onclick: async () => {
@@ -204,7 +224,7 @@ export async function chatView(root, [channelArg]) {
 
 // ================= maintenance =================
 const PRI = { urgent: 'bad', high: 'warn', normal: '', low: 'muted' };
-const CAT = { repair: '🔧 Repair', supplies: '🧴 Supplies', safety: '⚠️ Safety', other: 'Other' };
+const CAT = { repair: '🔧 Repair', supplies: '🧴 Supplies', safety: '⚠️ Safety', lost_found: '🔍 Lost & found', other: 'Other' };
 const MSTATUS = { open: 'Open', in_progress: 'In progress', waiting: 'Waiting on parts', done: 'Done' };
 
 export async function maintListView(root) {
@@ -215,7 +235,7 @@ export async function maintListView(root) {
     h('div', { class: 'tabs' }, ['open', 'done'].map((f) => h('a', { class: 'tab' + (f === filter ? ' on' : ''), href: '#/maint', onclick: () => sessionStorage.setItem('maintFilter', f) }, f === 'open' ? 'Open' : 'Completed'))),
     rows.length
       ? h('ul', { class: 'cards' }, rows.map((m) => h('li', null, h('a', { class: 'card link', href: '#/maint/' + m.id },
-          h('div', { class: 'row between' }, h('b', null, m.title), pill(PRI[m.priority], m.priority)),
+          h('div', { class: 'row between' }, h('b', null, m.title), h('span', null, m.reporting_gap ? pill('bad', 'reporting gap') : null, pill(PRI[m.priority], m.priority))),
           h('div', { class: 'muted small' }, [CAT[m.category], m.room_number ? 'Room ' + m.room_number : m.location, MSTATUS[m.status]].filter(Boolean).join(' · ')),
           h('div', { class: 'muted small' }, `${m.reporter} · ${ago(m.created_at)}${m.assignee ? ' · assigned to ' + m.assignee : ''}${m.comment_count ? ' · 💬' + m.comment_count : ''}`)))))
       : h('p', { class: 'muted center' }, filter === 'open' ? 'Nothing open. 🎉' : 'Nothing completed yet.')
@@ -232,7 +252,8 @@ export async function maintNewView(root) {
     category: h('select', null, Object.entries(CAT).map(([k, v]) => h('option', { value: k }, v))),
     priority: h('select', null, ['low', 'normal', 'high', 'urgent'].map((p) => h('option', { value: p, selected: p === 'normal' }, p[0].toUpperCase() + p.slice(1)))),
     title: h('input', { placeholder: 'What is the problem? (short)', maxlength: 120, required: true }),
-    desc: h('textarea', { rows: 3, placeholder: 'Details (optional)', maxlength: 1500 }),
+    desc: h('textarea', { rows: 3, placeholder: 'Details (optional). For lost & found: what it is, room number, date.', maxlength: 1500 }),
+    gap: h('input', { type: 'checkbox' }),
   };
   const chip = h('span', { class: 'muted' });
   root.append(h('a', { class: 'back', href: '#/maint' }, '‹ Back'), h('h2', null, 'New request'),
@@ -240,13 +261,14 @@ export async function maintNewView(root) {
       e.preventDefault();
       const fd = new FormData();
       fd.append('room_id', f.room.value); fd.append('location', f.location.value); fd.append('category', f.category.value);
-      fd.append('priority', f.priority.value); fd.append('title', f.title.value); fd.append('description', f.desc.value);
+      fd.append('priority', f.priority.value); fd.append('title', f.title.value); fd.append('description', f.desc.value); fd.append('reporting_gap', f.gap.checked ? '1' : '0');
       if (photo) fd.append('photo', photo, 'issue.jpg');
       if (await attempt(() => api('POST', '/api/maintenance', fd), 'Request sent')) location.hash = '#/maint';
     } },
       h('label', null, 'Title', f.title), h('label', null, 'Room', f.room), h('label', null, 'Other location', f.location),
       h('div', { class: 'grid2' }, h('label', null, 'Type', f.category), h('label', null, 'How urgent?', f.priority)),
       h('label', null, 'Details', f.desc),
+      isMgr() && h('label', { class: 'inline' }, f.gap, ' A guest reported this and staff never logged it (Reporting Gap)'),
       h('div', { class: 'row' }, photoPicker('📷 Add photo', (b) => { photo = b; chip.textContent = '✓ Photo attached'; }), chip),
       h('button', { class: 'btn primary big' }, 'Send request')));
 }
@@ -256,6 +278,7 @@ export async function maintDetailView(root, [id]) {
   const staff = isMgr() ? await GET('/api/staff') : [];
   root.append(h('a', { class: 'back', href: '#/maint' }, '‹ Back'),
     h('div', { class: 'row between' }, h('h2', null, m.title), pill(PRI[m.priority], m.priority)),
+    m.reporting_gap ? h('div', { class: 'note bad' }, 'Reporting Gap: a guest found this before staff logged it. Per the playbook this is a reporting failure, not just a maintenance failure.') : null,
     h('p', { class: 'muted' }, [CAT[m.category], m.room_number ? 'Room ' + m.room_number : m.location, `by ${m.reporter}`, fmtDateTime(m.created_at)].filter(Boolean).join(' · ')));
   if (m.description) root.append(h('p', { class: 'card' }, m.description));
   if (m.photo) root.append(h('img', { class: 'issue-photo', src: photoUrl(m.photo), alt: 'Issue photo', onclick: () => viewPhoto(m.photo) }));
@@ -263,12 +286,14 @@ export async function maintDetailView(root, [id]) {
   if (isMgr()) {
     const status = h('select', null, Object.entries(MSTATUS).map(([k, v]) => h('option', { value: k, selected: k === m.status }, v)));
     const pri = h('select', null, ['low', 'normal', 'high', 'urgent'].map((p) => h('option', { value: p, selected: p === m.priority }, p)));
+    const gapBox = h('input', { type: 'checkbox', checked: !!m.reporting_gap });
     const who = h('select', null, h('option', { value: '' }, 'Unassigned'), staff.map((s) => h('option', { value: s.id, selected: s.id === m.assigned_to }, s.name)));
     root.append(h('section', { class: 'card form' },
       h('div', { class: 'grid2' }, h('label', null, 'Status', status), h('label', null, 'Priority', pri)),
       h('label', null, 'Assigned to', who),
+      h('label', { class: 'inline' }, gapBox, ' Reporting Gap: a guest found this, staff had not logged it'),
       h('button', { class: 'btn primary', onclick: async () => {
-        if (await attempt(() => PATCH('/api/maintenance/' + m.id, { status: status.value, priority: pri.value, assigned_to: who.value || null }), 'Saved')) location.reload();
+        if (await attempt(() => PATCH('/api/maintenance/' + m.id, { status: status.value, priority: pri.value, assigned_to: who.value || null, reporting_gap: gapBox.checked }), 'Saved')) location.reload();
       } }, 'Save changes')));
   } else {
     root.append(h('p', null, 'Status: ', pill(m.status === 'done' ? 'ok' : '', MSTATUS[m.status]), m.assignee ? ` · ${m.assignee} is on it` : ''));
@@ -281,17 +306,3 @@ export async function maintDetailView(root, [id]) {
       if (box.value.trim() && await attempt(() => POST(`/api/maintenance/${m.id}/comments`, { body: box.value }))) location.reload();
     } }, 'Post'))));
 }
-
-// ================= more menu / account =================
-export async function accountView(root) {
-  const cur = h('input', { type: 'password', autocomplete: 'current-password' });
-  const nxt = h('input', { type: 'password', autocomplete: 'new-password', minlength: 6 });
-  root.append(h('h2', null, 'My account'),
-    h('section', { class: 'card' }, h('b', null, S.me.name), h('div', { class: 'muted' }, `@${S.me.username} · ${S.me.role}`)),
-    h('form', { class: 'card form', onsubmit: async (e) => {
-      e.preventDefault();
-      if (await attempt(() => POST('/api/me/password', { current: cur.value, next: nxt.value }), 'Password changed')) { cur.value = ''; nxt.value = ''; }
-    } }, h('h3', null, 'Change password'), h('label', null, 'Current password', cur), h('label', null, 'New password (6+ characters)', nxt), h('button', { class: 'btn primary' }, 'Update password')),
-    h('button', { class: 'btn ghost block', onclick: async () => { await POST('/api/logout'); location.hash = ''; location.reload(); } }, 'Sign out'));
-}
-

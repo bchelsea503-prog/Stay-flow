@@ -21,6 +21,11 @@ export async function homeView(root) {
     stat('Ready', `${rc.clean}/${totalRooms}`, 'ok'),
     stat('Out of order', rc.out_of_order, rc.out_of_order ? 'bad' : '', '#/roomlist')));
 
+  if (d.attention.length) {
+    root.append(h('section', { class: 'card attention' }, h('h3', null, 'Needs attention'),
+      h('ul', { class: 'list tight' }, d.attention.map((a) => h('li', null, a.href ? h('a', { href: a.href }, a.text) : h('span', null, a.text))))));
+  }
+
   // review queue
   if (d.pending.length) {
     root.append(h('section', { class: 'card' }, h('h3', null, `Rooms to review (${d.pending.length})`),
@@ -33,12 +38,13 @@ export async function homeView(root) {
       h('a', { class: 'btn primary', href: '#/rooms' }, 'Assign rooms')));
   }
 
-  // who is working
-  root.append(h('section', { class: 'card' }, h('h3', null, `On the clock now (${d.clockedIn.length})`),
+  // live shift view
+  root.append(h('section', { class: 'card' }, h('h3', null, `Live shift (${d.clockedIn.length} on the clock)`),
     d.clockedIn.length
       ? h('ul', { class: 'list' }, d.clockedIn.map((c) => h('li', null,
-          h('span', null, h('b', null, c.name), c.suspicious && pill('bad', 'check clock-out')),
-          h('span', { class: 'muted' }, `since ${fmtTime(c.clock_in)} · ${duration(c.clock_in)}`))))
+          h('span', null, h('b', null, c.name), ' ', pill(c.status === 'Behind Schedule' ? 'bad' : c.status === 'On Break' ? 'warn' : c.status === 'On Task' ? 'in_progress' : '', c.status), c.suspicious && pill('bad', 'check clock-out'),
+            h('div', { class: 'muted small' }, `${c.task ? c.task + ' · ' : ''}${c.rooms_total ? `${c.rooms_done} of ${c.rooms_total} rooms done` : 'no rooms assigned'}`)),
+          h('span', { class: 'muted small' }, `since ${fmtTime(c.clock_in)} · ${duration(c.clock_in)}`))))
       : h('p', { class: 'muted' }, 'Nobody is clocked in.'),
     h('div', { class: 'stats small' },
       stat('Hours today', fmtHrs(d.dayHours)),
@@ -63,6 +69,11 @@ export async function homeView(root) {
     d.lowStock.length
       ? h('ul', { class: 'list' }, d.lowStock.map((i) => h('li', null, h('b', null, i.name), h('span', { class: i.qty === 0 ? 'bad-text' : 'warn-text' }, `${i.qty} / ${i.par} ${i.unit}`))))
       : h('p', { class: 'muted' }, 'Everything is above par level. ✓')));
+
+  root.append(h('section', { class: 'card' }, h('h3', null, `Deep clean due (every ${d.deepIntervalDays} days)`),
+    d.deepDue.length
+      ? [h('p', null, d.deepDue.map((r) => `${r.number}${r.last_deep ? ' (' + fmtDay(r.last_deep) + ')' : ' (none recorded)'}`).join(', ')), h('p', { class: 'muted small' }, 'Assign these as "Deep clean" from the Rooms tab.')]
+      : h('p', { class: 'muted' }, 'All rooms are within their deep-clean window. ✓')));
 
   if (isOwner() && d.activity) {
     root.append(h('section', { class: 'card' }, h('h3', null, 'Recent activity'),
@@ -169,40 +180,49 @@ export async function hoursView(root) {
       h('button', { class: 'btn ghost', onclick: () => setRange(addDays(S.today, -13), S.today) }, 'Last 14 days'),
       f, '→', t),
     h('section', { class: 'card scroll' }, h('table', null,
-      h('thead', null, h('tr', null, ['Employee', 'Regular', 'OT', 'Total'].concat(isOwner() ? ['Pay'] : []).map((x) => h('th', null, x)))),
-      h('tbody', null, rep.users.map((u) => h('tr', null, h('td', null, u.name, u.open && pill('ok', 'on clock')), h('td', null, fmtHrs(u.regular)), h('td', { class: u.overtime ? 'warn-text' : '' }, fmtHrs(u.overtime)), h('td', null, h('b', null, fmtHrs(u.hours))), isOwner() && h('td', null, money(u.pay)))),
-        !rep.users.length && h('tr', null, h('td', { colspan: 5, class: 'muted' }, 'No time recorded in this range.'))),
-      h('tfoot', null, h('tr', null, h('td', null, 'Total'), h('td'), h('td', null, fmtHrs(rep.totals.overtime)), h('td', null, fmtHrs(rep.totals.hours)), isOwner() && h('td', null, money(rep.totals.pay)))))),
+      h('thead', null, h('tr', null, ['Employee', 'Regular', 'OT', 'Total', 'Breaks'].concat(isOwner() ? ['Pay'] : []).map((x) => h('th', null, x)))),
+      h('tbody', null, rep.users.map((u) => h('tr', null, h('td', null, u.name, u.open && pill('ok', 'on clock')), h('td', null, fmtHrs(u.regular)), h('td', { class: u.overtime ? 'warn-text' : '' }, fmtHrs(u.overtime)), h('td', null, h('b', null, fmtHrs(u.hours))), h('td', { class: 'muted' }, fmtHrs(u.break_hours)), isOwner() && h('td', null, money(u.pay)))),
+        !rep.users.length && h('tr', null, h('td', { colspan: 6, class: 'muted' }, 'No time recorded in this range.'))),
+      h('tfoot', null, h('tr', null, h('td', null, 'Total'), h('td'), h('td', null, fmtHrs(rep.totals.overtime)), h('td', null, fmtHrs(rep.totals.hours)), h('td'), isOwner() && h('td', null, money(rep.totals.pay)))))),
+    h('button', { class: 'btn ghost block no-print', onclick: () => window.print() }, '🖨 Print this report'),
     h('a', { class: 'btn ghost block', href: `/api/reports/hours?format=csv&from=${from}&to=${to}`, download: '' }, '⬇ Download CSV for payroll'),
-    h('p', { class: 'muted small' }, `Overtime = hours over ${rep.overtime_weekly_hours}/week (Mon–Sun), paid at 1.5×. Times shown in ${S.settings.timezone}.`));
+    h('p', { class: 'muted small' }, `Overtime = hours over ${rep.overtime_weekly_hours}/week (Mon–Sun), paid at 1.5×. Breaks are ${rep.breaks_unpaid ? 'unpaid and deducted' : 'paid and included'}. Times shown in ${S.settings.timezone}.`));
 
   root.append(h('h3', null, 'Time entries'),
     entries.length ? h('ul', { class: 'cards' }, entries.map((e) => h('li', { class: 'card row between' },
-      h('div', null, h('b', null, e.name), h('div', { class: 'muted small' }, `${fmtDateTime(e.clock_in)} → ${e.clock_out ? fmtTime(e.clock_out) : 'still on'} · ${duration(e.clock_in, e.clock_out)}${e.edited_by ? ' · edited' : ''}${e.note ? ' · ' + e.note : ''}`)),
-      h('button', { class: 'btn ghost', onclick: () => entryModal(e, staff, reload) }, 'Edit')))) : h('p', { class: 'muted' }, 'No entries.'));
+      h('div', null, h('b', null, e.name), e.flags.map((f) => pill('bad', f)),
+        h('div', { class: 'muted small' }, `${fmtDateTime(e.clock_in)} → ${e.clock_out ? fmtTime(e.clock_out) : 'still on'} · ${duration(e.clock_in, e.clock_out)}${e.break_minutes ? ' · breaks ' + e.break_minutes + ' min' : ''}${e.source === 'manual' ? ' · manual entry' : ''}${e.edited ? ' · corrected' : ''}`)),
+      h('button', { class: 'btn ghost no-print', onclick: () => entryModal(e, staff, reload) }, e.edited ? 'Edit / history' : 'Edit')))) : h('p', { class: 'muted' }, 'No entries.'));
 
   root.append(h('h3', null, 'Room quality & speed'),
-    h('section', { class: 'card scroll' }, h('table', null, h('thead', null, h('tr', null, ['Housekeeper', 'Rooms', 'Approved', 'Sent back', 'Avg min/room'].map((x) => h('th', null, x)))),
-      h('tbody', null, prod.users.map((u) => h('tr', null, h('td', null, u.name), h('td', null, u.rooms), h('td', null, u.approved), h('td', { class: u.rejected ? 'warn-text' : '' }, u.rejected), h('td', null, u.avg_minutes ?? '—'))),
-        !prod.users.length && h('tr', null, h('td', { colspan: 5, class: 'muted' }, 'No cleanings in range.'))))));
+    h('section', { class: 'card scroll' }, h('table', null, h('thead', null, h('tr', null, ['Housekeeper', 'Inspected', 'First-pass', 'Pass rate', 'Sent back', 'Avg min/room'].map((x) => h('th', null, x)))),
+      h('tbody', null, prod.users.map((u) => h('tr', null, h('td', null, u.name), h('td', null, u.rooms), h('td', null, u.first_pass), h('td', { class: u.pass_rate < prod.pass_rate_target ? 'warn-text' : '' }, u.pass_rate + '%'), h('td', null, u.sent_back), h('td', null, u.avg_minutes ?? '—'))),
+        !prod.users.length && h('tr', null, h('td', { colspan: 6, class: 'muted' }, 'No inspected cleanings in range.'))))),
+    h('p', { class: 'muted small' }, `Pass rate = rooms approved the first time. SOP goal: ${prod.pass_rate_target}%+. Time is measured from Start to Submit.`));
 }
 
 function entryModal(e, staff, done) {
-  modal(e ? 'Edit time entry' : 'Add time', (body, close) => {
+  modal(e ? 'Edit time entry' : 'Add missed time', (body, close) => {
     const who = h('select', { disabled: !!e }, staff.map((s) => h('option', { value: s.id, selected: e && s.id === e.user_id }, s.name)));
     const cin = h('input', { type: 'datetime-local', value: isoToLocalInput(e?.clock_in) });
     const cout = h('input', { type: 'datetime-local', value: isoToLocalInput(e?.clock_out) });
-    const note = h('input', { placeholder: 'Reason / note', value: e?.note || '', maxlength: 200 });
+    const reason = h('input', { placeholder: 'Reason for the correction (required)', maxlength: 300 });
+    const hist = h('div');
     body.append(h('div', { class: 'form' }, !e && h('label', null, 'Employee', who),
-      h('label', null, 'Clock in', cin), h('label', null, 'Clock out (leave blank if still working)', cout), h('label', null, 'Note', note),
-      h('p', { class: 'muted small' }, `Times are in ${S.settings.timezone}. Every edit is logged.`),
+      h('label', null, 'Clock in', cin), h('label', null, 'Clock out (leave blank if still working)', cout), h('label', null, 'Reason', reason),
+      h('p', { class: 'muted small' }, `Times are in ${S.settings.timezone}. The original is always kept, with your name and the reason.`),
       h('div', { class: 'row between' },
-        e ? h('button', { class: 'btn danger', onclick: async () => { if (await confirmBox('Delete this entry?', 'Delete') && await attempt(() => DEL('/api/clock/entries/' + e.id), 'Deleted')) { close(); done(); } } }, 'Delete') : h('span'),
+        e ? h('button', { class: 'btn danger', onclick: async () => {
+          if (reason.value.trim().length < 3) return toast('Enter a reason first', 'err');
+          if (await confirmBox('Void this entry? It stops counting toward hours but stays on record.', 'Void') && await attempt(() => POST(`/api/clock/entries/${e.id}/void`, { reason: reason.value }), 'Voided')) { close(); done(); }
+        } }, 'Void entry') : h('span'),
         h('button', { class: 'btn primary', onclick: async () => {
-          const payload = { clock_in: localInputToIso(cin.value), clock_out: localInputToIso(cout.value), note: note.value };
+          const payload = { clock_in: localInputToIso(cin.value), clock_out: localInputToIso(cout.value), reason: reason.value };
           const r = await attempt(() => (e ? PATCH('/api/clock/entries/' + e.id, payload) : POST('/api/clock/entries', { ...payload, user_id: Number(who.value) })), 'Saved');
           if (r) { close(); done(); }
-        } }, 'Save'))));
+        } }, 'Save')), hist));
+    if (e) GET(`/api/clock/entries/${e.id}/history`).then((hs) => hs.length && hist.append(h('h4', null, 'Correction history'), h('ul', { class: 'list tight' }, hs.map((x) =>
+      h('li', null, h('span', null, `${x.action} by ${x.editor}: ${x.reason}`, x.old_in ? h('div', { class: 'muted small' }, `was ${fmtDateTime(x.old_in)} → ${x.old_out ? fmtTime(x.old_out) : 'open'}`) : null), h('span', { class: 'muted small' }, ago(x.created_at)))))));
   });
 }
 
@@ -236,11 +256,14 @@ function adjustModal(i, done) {
     const amt = h('input', { type: 'number', step: 'any', inputmode: 'decimal', placeholder: 'e.g. 12 or -3' });
     const count = h('input', { type: 'number', step: 'any', min: 0, inputmode: 'decimal', placeholder: 'Actual count' });
     const note = h('input', { placeholder: 'Note (delivery, laundry loss, …)', maxlength: 200 });
-    const save = async (payload) => { if (await attempt(() => POST(`/api/inventory/${i.id}/adjust`, { ...payload, note: note.value }), 'Updated')) { close(); done(); } };
+    const room = h('select', null, h('option', { value: '' }, 'Not for a specific room'));
+    GET('/api/rooms').then((rs) => rs.forEach((r) => room.append(h('option', { value: r.id }, 'Used in room ' + r.number))));
+    const save = async (payload) => { if (await attempt(() => POST(`/api/inventory/${i.id}/adjust`, { ...payload, note: note.value, room_id: room.value }), 'Updated')) { close(); done(); } };
     body.append(h('div', { class: 'form' }, h('p', null, `On hand: ${i.qty} ${i.unit}`),
       h('label', null, 'Add (+) or use (−)', amt), h('button', { class: 'btn primary', onclick: () => save({ delta: amt.value }) }, 'Apply change'),
+      h('label', null, 'Log against a room (optional)', room),
       h('hr'), h('label', null, 'Or set an exact count', count), h('button', { class: 'btn', onclick: () => save({ set: count.value }) }, 'Save recount'), note));
-    GET(`/api/inventory/${i.id}/log`).then((log) => body.append(h('h4', null, 'History'), h('ul', { class: 'list tight' }, log.slice(0, 8).map((l) => h('li', null, h('span', null, `${l.delta > 0 ? '+' : ''}${l.delta} · ${l.name}${l.note ? ' · ' + l.note : ''}`), h('span', { class: 'muted small' }, ago(l.created_at)))))));
+    GET(`/api/inventory/${i.id}/log`).then((log) => body.append(h('h4', null, 'History'), h('ul', { class: 'list tight' }, log.slice(0, 8).map((l) => h('li', null, h('span', null, `${l.delta > 0 ? '+' : ''}${l.delta} · ${l.name}${l.room_number ? ' · Rm ' + l.room_number : ''}${l.note ? ' · ' + l.note : ''}`), h('span', { class: 'muted small' }, ago(l.created_at)))))));
   });
 }
 
@@ -253,7 +276,7 @@ function itemModal(i, done) {
       loc: h('input', { value: i?.location || '' }),
     };
     body.append(h('div', { class: 'form' }, h('label', null, 'Name', f.name), h('div', { class: 'grid2' }, h('label', null, 'Category', f.category), h('label', null, 'Unit', f.unit)),
-      !i && h('label', null, 'Starting quantity', f.qty), h('div', { class: 'grid2' }, h('label', null, 'Par level (reorder at/below)', f.par), isOwner() && h('label', null, 'Cost per unit', f.cost)),
+      !i && h('label', null, 'Starting quantity', f.qty), isOwner() ? h('div', { class: 'grid2' }, h('label', null, 'Par level (reorder at/below)', f.par), h('label', null, 'Cost per unit', f.cost)) : h('p', { class: 'muted small' }, 'Par levels are set by the owner.'),
       h('label', null, 'Where it lives', f.loc),
       h('div', { class: 'row between' },
         i ? h('button', { class: 'btn danger', onclick: async () => { if (await confirmBox(`Remove ${i.name}?`, 'Remove') && await attempt(() => DEL('/api/inventory/' + i.id))) { close(); done(); } } }, 'Remove') : h('span'),
@@ -266,12 +289,22 @@ function itemModal(i, done) {
 
 // ================= team =================
 export async function teamView(root) {
-  const users = await GET('/api/users');
+  const [users, acc, ack] = await Promise.all([GET('/api/users'), GET('/api/accountability/summary'), GET('/api/ack/status')]);
   const reload = () => { root.replaceChildren(); teamView(root); };
+  const accOf = Object.fromEntries(acc.map((a) => [a.id, a]));
+  const signed = Object.fromEntries(ack.map((a) => [a.id, a.signed_at]));
   root.append(h('div', { class: 'row between' }, h('h2', null, 'Team'), h('button', { class: 'btn primary', onclick: () => userModal(null, reload) }, '+ Add person')),
-    h('ul', { class: 'cards' }, users.map((u) => h('li', { class: 'card row between' + (u.active ? '' : ' inactive'), onclick: () => (u.role === 'owner' ? null : userModal(u, reload)) },
-      h('div', null, h('b', null, u.name), h('div', { class: 'muted small' }, `@${u.username}${u.phone ? ' · ' + u.phone : ''}${isOwner() && u.role !== 'owner' ? ' · ' + money(u.hourly_rate) + '/hr' : ''}`)),
-      h('span', null, !u.active && pill('', 'inactive'), pill(u.role === 'employee' ? '' : 'ok', u.role))))));
+    h('ul', { class: 'cards' }, users.map((u) => {
+      const a = accOf[u.id];
+      return h('li', { class: 'card row between' + (u.active ? '' : ' inactive') },
+        h('a', { class: 'grow plain', href: u.role === 'owner' ? null : '#/employee/' + u.id },
+          h('b', null, u.name), h('div', { class: 'muted small' }, `@${u.username}${u.phone ? ' · ' + u.phone : ''}${isOwner() && u.role !== 'owner' ? ' · ' + money(u.hourly_rate) + '/hr' : ''}`),
+          a && u.active && h('div', { class: 'small' },
+            pill(a.warnings ? 'bad' : 'ok', `warnings ${a.warnings}/1`), a.zero_tolerance ? pill('bad', `zero-tol ${a.zero_tolerance}`) : null,
+            signed[u.id] ? pill('ok', 'signed') : pill('warn', 'not signed'))),
+        h('div', { class: 'col-end' }, !u.active && pill('', 'inactive'), pill(u.role === 'employee' ? '' : 'ok', u.role),
+          u.role !== 'owner' && h('button', { class: 'btn ghost', 'aria-label': 'Edit ' + u.name, onclick: () => userModal(u, reload) }, '✎')));
+    })));
 }
 
 function userModal(u, done) {
@@ -298,20 +331,33 @@ function userModal(u, done) {
 }
 
 // ================= checklist template =================
+const SCOPE_LABEL = { all: 'every clean', checkout: 'checkouts + deep cleans', deep: 'deep cleans only' };
+
 export async function checklistView(root) {
   const items = await GET('/api/checklist');
   const reload = () => { root.replaceChildren(); checklistView(root); };
-  const text = h('input', { placeholder: 'New task, e.g. "Wipe baseboards"', maxlength: 200 });
-  const co = h('input', { type: 'checkbox' });
-  root.append(h('h2', null, 'Cleaning checklist'), h('p', { class: 'muted' }, "These are the tasks every housekeeper must tick off before they can submit a room. Changes apply to rooms assigned from now on."),
-    h('form', { class: 'card form', onsubmit: async (e) => { e.preventDefault(); if (text.value && await attempt(() => POST('/api/checklist', { text: text.value, checkout_only: co.checked }))) reload(); } },
-      h('div', { class: 'row' }, text, h('button', { class: 'btn primary' }, 'Add')), h('label', { class: 'inline' }, co, ' Checkout cleans only (skip on stayovers)')),
-    h('ul', { class: 'cards' }, items.map((it, idx) => h('li', { class: 'card row between' },
-      h('div', { class: 'grow' }, it.text, it.checkout_only ? h('div', { class: 'muted small' }, 'checkout only') : null),
-      h('div', { class: 'row' },
+  root.append(h('h2', null, 'Room cleaning standard'),
+    h('p', { class: 'muted' }, 'Every housekeeper must tick every task, and attach the proof photo, before a room can be submitted. A room is only released after a manager inspects it.' + (isOwner() ? ' Changes apply to rooms assigned from now on.' : ' Only the owner can change the standard.')));
+  if (isOwner()) {
+    const text = h('input', { placeholder: 'New task, e.g. "Wipe baseboards"', maxlength: 200 });
+    const section = h('input', { placeholder: 'Section', list: 'secs', value: 'Bedroom' });
+    const scope = h('select', null, Object.entries(SCOPE_LABEL).map(([k, v]) => h('option', { value: k }, 'Applies to: ' + v)));
+    root.append(h('datalist', { id: 'secs' }, [...new Set(items.map((i) => i.section))].map((x) => h('option', { value: x }))),
+      h('form', { class: 'card form', onsubmit: async (e) => { e.preventDefault(); if (text.value && await attempt(() => POST('/api/checklist', { text: text.value, section: section.value, scope: scope.value }))) reload(); } },
+        text, h('div', { class: 'row' }, section, scope, h('button', { class: 'btn primary' }, 'Add'))));
+  }
+  let last = null;
+  const ul = h('ul', { class: 'cards' });
+  items.forEach((it, idx) => {
+    if (it.section !== last) { last = it.section; ul.append(h('li', null, h('h4', { class: 'sect' }, it.section || 'Tasks'))); }
+    ul.append(h('li', { class: 'card row between' },
+      h('div', { class: 'grow' }, it.text, it.scope !== 'all' ? h('div', { class: 'muted small' }, SCOPE_LABEL[it.scope]) : null),
+      isOwner() && h('div', { class: 'row' },
         h('button', { class: 'btn ghost', 'aria-label': 'Move up', disabled: idx === 0, onclick: async () => { await swap(items[idx - 1], it); reload(); } }, '↑'),
         h('button', { class: 'btn ghost', 'aria-label': 'Edit', onclick: () => editItem(it, reload) }, '✎'),
-        h('button', { class: 'btn ghost', 'aria-label': 'Delete', onclick: async () => { if (await confirmBox('Remove this task from the checklist?', 'Remove') && await attempt(() => DEL('/api/checklist/' + it.id))) reload(); } }, '🗑'))))));
+        h('button', { class: 'btn ghost', 'aria-label': 'Delete', onclick: async () => { if (await confirmBox('Remove this task from the standard?', 'Remove') && await attempt(() => DEL('/api/checklist/' + it.id))) reload(); } }, '🗑'))));
+  });
+  root.append(ul);
 }
 async function swap(a, b) {
   const pa = a.position, pb = b.position === a.position ? a.position + 1 : b.position;
@@ -320,9 +366,11 @@ async function swap(a, b) {
 }
 function editItem(it, done) {
   modal('Edit task', (body, close) => {
-    const t = h('input', { value: it.text, maxlength: 200 }); const c = h('input', { type: 'checkbox', checked: !!it.checkout_only });
-    body.append(h('div', { class: 'form' }, t, h('label', { class: 'inline' }, c, ' Checkout cleans only'),
-      h('button', { class: 'btn primary', onclick: async () => { if (await attempt(() => PATCH('/api/checklist/' + it.id, { text: t.value, checkout_only: c.checked }), 'Saved')) { close(); done(); } } }, 'Save')));
+    const t = h('input', { value: it.text, maxlength: 200 });
+    const sec = h('input', { value: it.section });
+    const scope = h('select', null, Object.entries(SCOPE_LABEL).map(([k, v]) => h('option', { value: k, selected: k === it.scope }, v)));
+    body.append(h('div', { class: 'form' }, t, h('label', null, 'Section', sec), h('label', null, 'Applies to', scope),
+      h('button', { class: 'btn primary', onclick: async () => { if (await attempt(() => PATCH('/api/checklist/' + it.id, { text: t.value, section: sec.value, scope: scope.value }), 'Saved')) { close(); done(); } } }, 'Save')));
   });
 }
 
@@ -333,16 +381,33 @@ export async function settingsView(root) {
     name: h('input', { value: s.property_name }), tz: h('input', { value: s.timezone, list: 'tzs' }),
     photos: h('input', { type: 'number', min: 0, max: 10, value: s.min_photos }), ot: h('input', { type: 'number', min: 1, value: s.overtime_weekly_hours }),
     clock: h('input', { type: 'checkbox', checked: s.require_clock_in === '1' }),
+    ack: h('input', { type: 'checkbox', checked: s.require_ack === '1' }),
+    unpaid: h('input', { type: 'checkbox', checked: s.break_unpaid === '1' }),
+    maxBreak: h('input', { type: 'number', min: 1, value: s.max_break_minutes }),
+    tCheckout: h('input', { type: 'number', min: 5, value: s.target_checkout_max }),
+    tStay: h('input', { type: 'number', min: 5, value: s.target_stayover_max }),
+    tSuite: h('input', { type: 'number', min: 5, value: s.target_suite_max }),
+    behind: h('input', { type: 'number', step: '0.05', min: 1, value: s.behind_factor }),
+    deep: h('input', { type: 'number', min: 7, value: s.deep_clean_interval_days }),
+    pass: h('input', { type: 'number', min: 1, max: 100, value: s.pass_rate_target }),
   };
   root.append(h('h2', null, 'Settings'),
     h('datalist', { id: 'tzs' }, ['America/Los_Angeles', 'America/Denver', 'America/Chicago', 'America/New_York'].map((z) => h('option', { value: z }))),
     h('form', { class: 'card form', onsubmit: async (e) => {
       e.preventDefault();
-      if (await attempt(() => PUT('/api/settings', { property_name: f.name.value, timezone: f.tz.value, min_photos: f.photos.value, overtime_weekly_hours: f.ot.value, require_clock_in: f.clock.checked }), 'Settings saved')) setTimeout(() => location.reload(), 600);
+      if (await attempt(() => PUT('/api/settings', { property_name: f.name.value, timezone: f.tz.value, min_photos: f.photos.value, overtime_weekly_hours: f.ot.value, require_clock_in: f.clock.checked,
+        require_ack: f.ack.checked, break_unpaid: f.unpaid.checked, max_break_minutes: f.maxBreak.value, target_checkout_max: f.tCheckout.value,
+        target_stayover_max: f.tStay.value, target_suite_max: f.tSuite.value, behind_factor: f.behind.value, deep_clean_interval_days: f.deep.value,
+        pass_rate_target: f.pass.value }), 'Settings saved')) setTimeout(() => location.reload(), 600);
     } },
       h('label', null, 'Property name', f.name), h('label', null, 'Property timezone (Ilwaco, WA = America/Los_Angeles)', f.tz),
       h('label', null, 'Photos required per room', f.photos), h('label', null, 'Overtime after (hours per week)', f.ot),
       h('label', { class: 'inline' }, f.clock, ' Staff must be clocked in to work on rooms'),
+      h('label', { class: 'inline' }, f.ack, ' Employees must sign the Acknowledgment before they can clock in'),
+      h('h3', null, 'Breaks'), h('label', { class: 'inline' }, f.unpaid, ' Breaks are unpaid (deducted from hours)'), h('label', null, 'Flag a single break longer than (minutes)', f.maxBreak),
+      h('h3', null, 'SOP targets'),
+      h('div', { class: 'grid2' }, h('label', null, 'Checkout max (min)', f.tCheckout), h('label', null, 'Stayover max (min)', f.tStay), h('label', null, 'Kitchen/suite max (min)', f.tSuite), h('label', null, '"Behind schedule" at × target', f.behind)),
+      h('div', { class: 'grid2' }, h('label', null, 'Deep clean every (days)', f.deep), h('label', null, 'Inspection pass-rate goal (%)', f.pass)),
       h('button', { class: 'btn primary' }, 'Save settings')),
     h('section', { class: 'card' }, h('h3', null, 'Backup'), h('p', { class: 'muted' }, 'Download a full copy of your data (staff, hours, rooms, inventory). Photos are kept on the server.'),
       h('a', { class: 'btn', href: '/api/backup', download: '' }, '⬇ Download backup')));

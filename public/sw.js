@@ -1,6 +1,6 @@
 // Caches the app shell so the app opens instantly. Data (/api) and photos (/uploads) are never cached.
-const CACHE = 'stayflow-v1';
-const SHELL = ['/', '/style.css', '/app.js', '/util.js', '/views-common.js', '/views-staff.js', '/views-mgr.js', '/icon.svg'];
+const CACHE = 'stayflow-v2';
+const SHELL = ['/', '/style.css', '/app.js', '/util.js', '/views-common.js', '/views-staff.js', '/views-mgr.js', '/views-people.js', '/icon.svg'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

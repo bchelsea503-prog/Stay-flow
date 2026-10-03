@@ -8,6 +8,7 @@ const path = require('path');
 
 const { db, tx, log, getSettings, UPLOAD_DIR, DATA_DIR, CHANNELS } = require('./db');
 const { localDate, addDays, weekStart, isYmd, hoursBetween } = require('./time');
+const playbook = require('./playbook');
 
 const app = express();
 app.set('trust proxy', process.env.TRUST_PROXY === '0' ? false : 1);
@@ -254,27 +255,71 @@ app.patch('/api/users/:id', mgr, (req, res) => {
 });
 
 // ---------- time clock ----------
+// All timestamps are taken from the server clock, never from the device.
 function openEntry(userId) {
-  return db.prepare('SELECT * FROM clock_entries WHERE user_id=? AND clock_out IS NULL ORDER BY id DESC').get(userId);
+  return db.prepare('SELECT * FROM clock_entries WHERE user_id=? AND clock_out IS NULL AND voided=0 ORDER BY id DESC').get(userId);
+}
+const openBreak = (entryId) => db.prepare('SELECT * FROM breaks WHERE entry_id=? AND end_at IS NULL').get(entryId);
+
+function breakMinutes(entryId, until) {
+  return db.prepare('SELECT start_at,end_at FROM breaks WHERE entry_id=?').all(entryId)
+    .reduce((a, b) => a + hoursBetween(b.start_at, b.end_at || until) * 60, 0);
+}
+
+function hasSigned(userId) {
+  return !!db.prepare('SELECT 1 FROM acknowledgments WHERE user_id=? AND version=?').get(userId, playbook.VERSION);
 }
 
 app.get('/api/clock/status', anyUser, (req, res) => {
   const open = openEntry(req.user.id);
   const t = today();
   const recent = db
-    .prepare('SELECT id,clock_in,clock_out FROM clock_entries WHERE user_id=? ORDER BY clock_in DESC LIMIT 14')
+    .prepare('SELECT id,clock_in,clock_out FROM clock_entries WHERE user_id=? AND voided=0 ORDER BY clock_in DESC LIMIT 14')
     .all(req.user.id);
   const z = tz();
-  const todayHours = recent
-    .filter((e) => localDate(z, new Date(e.clock_in)) === t)
-    .reduce((a, e) => a + hoursBetween(e.clock_in, e.clock_out || now()), 0);
-  res.json({ open: open ? { id: open.id, clock_in: open.clock_in } : null, today_hours: r2(todayHours), recent });
+  const unpaid = getSettings().break_unpaid === '1';
+  const n = now();
+  let todayHours = 0;
+  for (const e of recent) {
+    if (localDate(z, new Date(e.clock_in)) !== t) continue;
+    todayHours += hoursBetween(e.clock_in, e.clock_out || n) - (unpaid ? breakMinutes(e.id, n) / 60 : 0);
+  }
+  let brk = null;
+  if (open) {
+    const b = openBreak(open.id);
+    brk = { on_break: !!b, since: b?.start_at || null, minutes_today: Math.round(breakMinutes(open.id, n)) };
+  }
+  res.json({
+    open: open ? { id: open.id, clock_in: open.clock_in } : null,
+    break: brk, today_hours: r2(Math.max(0, todayHours)), recent,
+    needs_ack: req.user.role === 'employee' && getSettings().require_ack === '1' && !hasSigned(req.user.id),
+  });
 });
 
 app.post('/api/clock/in', anyUser, (req, res) => {
   if (openEntry(req.user.id)) throw HttpError(409, "You're already clocked in");
+  if (req.user.role === 'employee' && getSettings().require_ack === '1' && !hasSigned(req.user.id))
+    throw HttpError(409, 'Please read and sign the Employee Acknowledgment first. Open it from the link on the Clock screen or Me > SOP Playbook.');
   db.prepare('INSERT INTO clock_entries (user_id,clock_in) VALUES (?,?)').run(req.user.id, now());
   log(req.user.id, 'clock_in');
+  res.json({ ok: true });
+});
+
+app.post('/api/clock/break/start', anyUser, (req, res) => {
+  const e = openEntry(req.user.id);
+  if (!e) throw HttpError(409, "You're not clocked in");
+  if (openBreak(e.id)) throw HttpError(409, "You're already on a break");
+  db.prepare('INSERT INTO breaks (entry_id,user_id,start_at) VALUES (?,?,?)').run(e.id, req.user.id, now());
+  log(req.user.id, 'break_start');
+  res.json({ ok: true });
+});
+
+app.post('/api/clock/break/end', anyUser, (req, res) => {
+  const e = openEntry(req.user.id);
+  const b = e && openBreak(e.id);
+  if (!b) throw HttpError(409, "You're not on a break");
+  db.prepare('UPDATE breaks SET end_at=? WHERE id=?').run(now(), b.id);
+  log(req.user.id, 'break_end');
   res.json({ ok: true });
 });
 
@@ -285,7 +330,11 @@ app.post('/api/clock/out', anyUser, (req, res) => {
     .prepare("SELECT COUNT(*) c FROM assignments WHERE user_id=? AND status='in_progress'")
     .get(req.user.id).c;
   if (busy && !req.body.force) throw HttpError(409, `You still have ${busy} room(s) started but not submitted. Clock out anyway?`);
-  db.prepare('UPDATE clock_entries SET clock_out=? WHERE id=?').run(now(), e.id);
+  const t = now();
+  tx(() => {
+    db.prepare('UPDATE breaks SET end_at=? WHERE entry_id=? AND end_at IS NULL').run(t, e.id);
+    db.prepare('UPDATE clock_entries SET clock_out=? WHERE id=?').run(t, e.id);
+  });
   log(req.user.id, 'clock_out');
   res.json({ ok: true });
 });
@@ -293,62 +342,107 @@ app.post('/api/clock/out', anyUser, (req, res) => {
 function validIso(s) {
   return typeof s === 'string' && !isNaN(Date.parse(s)) ? new Date(s).toISOString() : null;
 }
+function needReason(v) {
+  const r = str(v, 300);
+  if (r.length < 3) throw HttpError(400, 'A reason is required for every timecard correction');
+  return r;
+}
 
-app.get('/api/clock/entries', mgr, (req, res) => {
-  const t = today();
-  const from = isYmd(req.query.from) ? req.query.from : addDays(t, -13);
-  const to = isYmd(req.query.to) ? req.query.to : t;
-  const z = tz();
+// Entries for a date range with break totals and discrepancy flags.
+function entriesFor(from, to, userId) {
+  const s = getSettings();
+  const z = s.timezone;
+  const maxBreak = Number(s.max_break_minutes) || 30;
+  const forgot = Number(s.forgotten_clockout_hours) || 14;
+  const n = now();
   let rows = db
     .prepare(
       `SELECT c.*, u.name FROM clock_entries c JOIN users u ON u.id=c.user_id
-       WHERE c.clock_in >= ? AND c.clock_in <= ? ORDER BY c.clock_in DESC`
+       WHERE c.voided=0 AND c.clock_in >= ? AND c.clock_in <= ? ORDER BY c.clock_in DESC`
     )
     .all(addDays(from, -1) + 'T00:00:00Z', addDays(to, 2) + 'T00:00:00Z')
     .filter((e) => {
       const d = localDate(z, new Date(e.clock_in));
       return d >= from && d <= to;
     });
-  if (int(req.query.user_id)) rows = rows.filter((e) => e.user_id === int(req.query.user_id));
-  res.json(rows);
+  if (userId) rows = rows.filter((e) => e.user_id === userId);
+  const brk = db.prepare('SELECT start_at,end_at FROM breaks WHERE entry_id=?');
+  for (const e of rows) {
+    const bs = brk.all(e.id);
+    e.break_minutes = Math.round(bs.reduce((a, b) => a + hoursBetween(b.start_at, b.end_at || n) * 60, 0));
+    e.flags = [];
+    if (!e.clock_out && hoursBetween(e.clock_in, n) > forgot) e.flags.push('Missed clock-out?');
+    if (bs.some((b) => hoursBetween(b.start_at, b.end_at || n) * 60 > maxBreak)) e.flags.push(`Break over ${maxBreak} min`);
+    e.edited = !!db.prepare('SELECT 1 FROM clock_edits WHERE entry_id=?').get(e.id);
+  }
+  return rows;
+}
+
+app.get('/api/clock/entries', mgr, (req, res) => {
+  const t = today();
+  const from = isYmd(req.query.from) ? req.query.from : addDays(t, -13);
+  const to = isYmd(req.query.to) ? req.query.to : t;
+  res.json(entriesFor(from, to, int(req.query.user_id)));
 });
+
+app.get('/api/clock/entries/:id/history', mgr, (req, res) => {
+  res.json(db.prepare(
+    `SELECT e.*, u.name AS editor FROM clock_edits e JOIN users u ON u.id=e.edited_by WHERE e.entry_id=? ORDER BY e.id DESC`
+  ).all(int(req.params.id)));
+});
+
+function checkTimes(cin, cout, rawOut) {
+  if (!cin || (rawOut && !cout)) throw HttpError(400, 'Invalid time');
+  if (cout && Date.parse(cout) <= Date.parse(cin)) throw HttpError(400, 'Clock-out must be after clock-in');
+  if (cout && hoursBetween(cin, cout) > 24) throw HttpError(400, "A single shift can't be longer than 24 hours");
+}
 
 app.post('/api/clock/entries', mgr, (req, res) => {
   const uid = int(req.body.user_id);
   const u = db.prepare('SELECT * FROM users WHERE id=?').get(uid);
   if (!u) throw HttpError(400, 'Pick an employee');
+  const reason = needReason(req.body.reason);
   const cin = validIso(req.body.clock_in);
   const cout = req.body.clock_out ? validIso(req.body.clock_out) : null;
-  if (!cin || (req.body.clock_out && !cout)) throw HttpError(400, 'Invalid time');
-  if (cout && Date.parse(cout) <= Date.parse(cin)) throw HttpError(400, 'Clock-out must be after clock-in');
-  if (cout && hoursBetween(cin, cout) > 24) throw HttpError(400, 'A single shift can\'t be longer than 24 hours');
-  db.prepare('INSERT INTO clock_entries (user_id,clock_in,clock_out,note,edited_by) VALUES (?,?,?,?,?)').run(
-    uid, cin, cout, str(req.body.note, 200), req.user.id
-  );
-  log(req.user.id, 'time_added', `${u.name} ${cin} → ${cout || 'open'}`);
+  checkTimes(cin, cout, req.body.clock_out);
+  tx(() => {
+    const r = db.prepare("INSERT INTO clock_entries (user_id,clock_in,clock_out,note,source,edited_by) VALUES (?,?,?,?,'manual',?)")
+      .run(uid, cin, cout, reason, req.user.id);
+    db.prepare('INSERT INTO clock_edits (entry_id,edited_by,action,reason,new_in,new_out) VALUES (?,?,?,?,?,?)')
+      .run(Number(r.lastInsertRowid), req.user.id, 'added', reason, cin, cout);
+  });
+  log(req.user.id, 'time_added', `${u.name}: ${reason}`);
   res.json({ ok: true });
 });
 
 app.patch('/api/clock/entries/:id', mgr, (req, res) => {
-  const e = db.prepare('SELECT c.*,u.name FROM clock_entries c JOIN users u ON u.id=c.user_id WHERE c.id=?').get(int(req.params.id));
+  const e = db.prepare('SELECT c.*,u.name FROM clock_entries c JOIN users u ON u.id=c.user_id WHERE c.id=? AND c.voided=0').get(int(req.params.id));
   if (!e) throw HttpError(404, 'No such entry');
+  const reason = needReason(req.body.reason);
   const cin = req.body.clock_in !== undefined ? validIso(req.body.clock_in) : e.clock_in;
   let cout = e.clock_out;
   if (req.body.clock_out !== undefined) cout = req.body.clock_out ? validIso(req.body.clock_out) : null;
-  if (!cin || (req.body.clock_out && !cout)) throw HttpError(400, 'Invalid time');
-  if (cout && Date.parse(cout) <= Date.parse(cin)) throw HttpError(400, 'Clock-out must be after clock-in');
-  if (cout && hoursBetween(cin, cout) > 24) throw HttpError(400, 'A single shift can\'t be longer than 24 hours');
-  const note = req.body.note !== undefined ? str(req.body.note, 200) : e.note;
-  db.prepare('UPDATE clock_entries SET clock_in=?,clock_out=?,note=?,edited_by=? WHERE id=?').run(cin, cout, note, req.user.id, e.id);
-  log(req.user.id, 'time_edited', `${e.name}: ${e.clock_in}/${e.clock_out || 'open'} → ${cin}/${cout || 'open'}`);
+  checkTimes(cin, cout, req.body.clock_out);
+  tx(() => {
+    db.prepare('INSERT INTO clock_edits (entry_id,edited_by,action,reason,old_in,old_out,new_in,new_out) VALUES (?,?,?,?,?,?,?,?)')
+      .run(e.id, req.user.id, 'edited', reason, e.clock_in, e.clock_out, cin, cout);
+    db.prepare('UPDATE clock_entries SET clock_in=?,clock_out=?,edited_by=? WHERE id=?').run(cin, cout, req.user.id, e.id);
+  });
+  log(req.user.id, 'time_edited', `${e.name}: ${reason}`);
   res.json({ ok: true });
 });
 
-app.delete('/api/clock/entries/:id', mgr, (req, res) => {
-  const e = db.prepare('SELECT c.*,u.name FROM clock_entries c JOIN users u ON u.id=c.user_id WHERE c.id=?').get(int(req.params.id));
+// Entries are never deleted: voiding hides them from totals but keeps the record and who/why.
+app.post('/api/clock/entries/:id/void', mgr, (req, res) => {
+  const e = db.prepare('SELECT c.*,u.name FROM clock_entries c JOIN users u ON u.id=c.user_id WHERE c.id=? AND c.voided=0').get(int(req.params.id));
   if (!e) throw HttpError(404, 'No such entry');
-  db.prepare('DELETE FROM clock_entries WHERE id=?').run(e.id);
-  log(req.user.id, 'time_deleted', `${e.name} ${e.clock_in}/${e.clock_out || 'open'}`);
+  const reason = needReason(req.body.reason);
+  tx(() => {
+    db.prepare('INSERT INTO clock_edits (entry_id,edited_by,action,reason,old_in,old_out) VALUES (?,?,?,?,?,?)')
+      .run(e.id, req.user.id, 'voided', reason, e.clock_in, e.clock_out);
+    db.prepare('UPDATE clock_entries SET voided=1, void_reason=?, edited_by=? WHERE id=?').run(reason, req.user.id, e.id);
+  });
+  log(req.user.id, 'time_voided', `${e.name}: ${reason}`);
   res.json({ ok: true });
 });
 
@@ -357,10 +451,11 @@ function hoursReport(from, to, withPay) {
   const s = getSettings();
   const z = s.timezone;
   const otLimit = Number(s.overtime_weekly_hours) || 40;
+  const unpaidBreaks = s.break_unpaid === '1';
   const entries = db
     .prepare(
       `SELECT c.*, u.name, u.hourly_rate, u.role FROM clock_entries c JOIN users u ON u.id=c.user_id
-       WHERE c.clock_in >= ? AND c.clock_in <= ? ORDER BY c.clock_in`
+       WHERE c.voided=0 AND c.clock_in >= ? AND c.clock_in <= ? ORDER BY c.clock_in`
     )
     .all(addDays(from, -1) + 'T00:00:00Z', addDays(to, 2) + 'T00:00:00Z');
   const byUser = new Map();
@@ -368,13 +463,16 @@ function hoursReport(from, to, withPay) {
   for (const e of entries) {
     const d = localDate(z, new Date(e.clock_in));
     if (d < from || d > to) continue;
-    const hrs = hoursBetween(e.clock_in, e.clock_out || t);
+    let hrs = hoursBetween(e.clock_in, e.clock_out || t);
+    const brk = breakMinutes(e.id, t) / 60;
+    if (unpaidBreaks) hrs = Math.max(0, hrs - brk);
     let u = byUser.get(e.user_id);
     if (!u) {
-      u = { id: e.user_id, name: e.name, role: e.role, rate: e.hourly_rate, hours: 0, days: {}, weeks: {}, open: false };
+      u = { id: e.user_id, name: e.name, role: e.role, rate: e.hourly_rate, hours: 0, breaks: 0, days: {}, weeks: {}, open: false };
       byUser.set(e.user_id, u);
     }
     u.hours += hrs;
+    u.breaks += brk;
     u.days[d] = (u.days[d] || 0) + hrs;
     const wk = weekStart(d);
     u.weeks[wk] = (u.weeks[wk] || 0) + hrs;
@@ -386,7 +484,7 @@ function hoursReport(from, to, withPay) {
     const regular = u.hours - overtime;
     const out = {
       id: u.id, name: u.name, role: u.role, open: u.open,
-      hours: r2(u.hours), regular: r2(regular), overtime: r2(overtime),
+      hours: r2(u.hours), regular: r2(regular), overtime: r2(overtime), break_hours: r2(u.breaks),
       days: Object.fromEntries(Object.entries(u.days).map(([k, v]) => [k, r2(v)])),
     };
     if (withPay) {
@@ -401,7 +499,7 @@ function hoursReport(from, to, withPay) {
     overtime: r2(users.reduce((a, u) => a + u.overtime, 0)),
   };
   if (withPay) totals.pay = r2(users.reduce((a, u) => a + u.pay, 0));
-  return { from, to, overtime_weekly_hours: otLimit, users, totals };
+  return { from, to, overtime_weekly_hours: otLimit, breaks_unpaid: unpaidBreaks, users, totals };
 }
 
 function rangeFromQuery(q) {
@@ -424,8 +522,8 @@ app.get('/api/reports/hours', mgr, (req, res) => {
   const rep = hoursReport(from, to, req.user.role === 'owner');
   if (req.query.format === 'csv') {
     const pay = req.user.role === 'owner';
-    const lines = [['Employee', 'Regular hrs', 'Overtime hrs', 'Total hrs'].concat(pay ? ['Rate', 'Gross pay'] : [])];
-    for (const u of rep.users) lines.push([u.name, u.regular, u.overtime, u.hours].concat(pay ? [u.rate, u.pay] : []));
+    const lines = [['Employee', 'Regular hrs', 'Overtime hrs', 'Total hrs', 'Break hrs (' + (rep.breaks_unpaid ? 'unpaid, excluded' : 'paid, included') + ')'].concat(pay ? ['Rate', 'Gross pay'] : [])];
+    for (const u of rep.users) lines.push([u.name, u.regular, u.overtime, u.hours, u.break_hours].concat(pay ? [u.rate, u.pay] : []));
     res.set({
       'Content-Type': 'text/csv; charset=utf-8',
       'Content-Disposition': `attachment; filename="hours_${from}_to_${to}.csv"`,
@@ -502,35 +600,42 @@ app.post('/api/rooms/mark-dirty', mgr, (req, res) => {
 });
 
 // ---------- checklist template ----------
+// Managers can view the standard; only the owner edits it (PRD: "edit playbook standards").
+const SCOPES = ['all', 'checkout', 'deep'];
+
 app.get('/api/checklist', mgr, (_req, res) => {
   res.json(db.prepare('SELECT * FROM checklist_items WHERE active=1 ORDER BY room_type, position, id').all());
 });
 
-app.post('/api/checklist', mgr, (req, res) => {
+app.post('/api/checklist', owner, (req, res) => {
   const text = str(req.body.text, 200);
   if (!text) throw HttpError(400, 'Describe the task');
-  const pos = (db.prepare('SELECT COALESCE(MAX(position),0)+1 p FROM checklist_items').get().p);
+  const pos = db.prepare('SELECT COALESCE(MAX(position),0)+1 p FROM checklist_items').get().p;
+  const scope = SCOPES.includes(req.body.scope) ? req.body.scope : 'all';
   const r = db
-    .prepare('INSERT INTO checklist_items (room_type,text,position,checkout_only) VALUES (?,?,?,?)')
-    .run(str(req.body.room_type, 40), text, pos, req.body.checkout_only ? 1 : 0);
+    .prepare('INSERT INTO checklist_items (room_type,section,text,position,scope) VALUES (?,?,?,?,?)')
+    .run(str(req.body.room_type, 40), str(req.body.section, 40), text, pos, scope);
   log(req.user.id, 'checklist_added', text);
   res.json({ id: Number(r.lastInsertRowid) });
 });
 
-app.patch('/api/checklist/:id', mgr, (req, res) => {
+app.patch('/api/checklist/:id', owner, (req, res) => {
   const it = db.prepare('SELECT * FROM checklist_items WHERE id=?').get(int(req.params.id));
   if (!it) throw HttpError(404, 'No such item');
-  db.prepare('UPDATE checklist_items SET text=?,room_type=?,checkout_only=?,position=? WHERE id=?').run(
-    req.body.text !== undefined ? str(req.body.text, 200) || it.text : it.text,
-    req.body.room_type !== undefined ? str(req.body.room_type, 40) : it.room_type,
-    req.body.checkout_only !== undefined ? (req.body.checkout_only ? 1 : 0) : it.checkout_only,
-    req.body.position !== undefined ? int(req.body.position) ?? it.position : it.position,
+  const b = req.body;
+  db.prepare('UPDATE checklist_items SET text=?,room_type=?,section=?,scope=?,position=? WHERE id=?').run(
+    b.text !== undefined ? str(b.text, 200) || it.text : it.text,
+    b.room_type !== undefined ? str(b.room_type, 40) : it.room_type,
+    b.section !== undefined ? str(b.section, 40) : it.section,
+    SCOPES.includes(b.scope) ? b.scope : it.scope,
+    b.position !== undefined ? int(b.position) ?? it.position : it.position,
     it.id
   );
+  log(req.user.id, 'checklist_edited', it.text);
   res.json({ ok: true });
 });
 
-app.delete('/api/checklist/:id', mgr, (req, res) => {
+app.delete('/api/checklist/:id', owner, (req, res) => {
   // Deactivate rather than delete so past inspections keep their records.
   db.prepare('UPDATE checklist_items SET active=0 WHERE id=?').run(int(req.params.id));
   log(req.user.id, 'checklist_removed', String(req.params.id));
@@ -544,6 +649,13 @@ const ASSIGN_SELECT = `
     (SELECT COUNT(*) FROM assignment_checks c WHERE c.assignment_id=a.id AND c.done=1) AS checks_done,
     (SELECT COUNT(*) FROM assignment_photos p WHERE p.assignment_id=a.id) AS photo_count
   FROM assignments a JOIN rooms r ON r.id=a.room_id JOIN users u ON u.id=a.user_id`;
+
+// Target minutes (upper end of the SOP range) for a cleaning.
+function targetMax(a, s = getSettings()) {
+  if (a.clean_type === 'stayover') return Number(s.target_stayover_max) || 20;
+  if (a.clean_type === 'deep') return null; // the SOP sets no deep-clean target
+  return /suite|kitchen/i.test(a.room_type || '') ? Number(s.target_suite_max) || 45 : Number(s.target_checkout_max) || 35;
+}
 
 app.get('/api/assignments', anyUser, (req, res) => {
   const t = today();
@@ -589,7 +701,7 @@ app.post('/api/assignments', mgr, (req, res) => {
       const items = db
         .prepare(
           `SELECT id FROM checklist_items WHERE active=1 AND (room_type='' OR room_type=?) ${
-            cleanType === 'stayover' ? 'AND checkout_only=0' : ''
+            cleanType === 'stayover' ? "AND scope='all'" : cleanType === 'checkout' ? "AND scope IN ('all','checkout')" : ''
           } ORDER BY position,id`
         )
         .all(room.type);
@@ -624,11 +736,14 @@ app.get('/api/assignments/:id', anyUser, (req, res) => {
   const a = loadAssignment(req);
   a.items = db
     .prepare(
-      `SELECT c.item_id, c.done, i.text FROM assignment_checks c JOIN checklist_items i ON i.id=c.item_id
+      `SELECT c.item_id, c.done, i.text, i.section,
+        EXISTS(SELECT 1 FROM assignment_failures f WHERE f.assignment_id=c.assignment_id AND f.item_id=c.item_id) AS failed
+       FROM assignment_checks c JOIN checklist_items i ON i.id=c.item_id
        WHERE c.assignment_id=? ORDER BY i.position, i.id`
     )
     .all(a.id);
   a.photos = db.prepare('SELECT id,filename,created_at FROM assignment_photos WHERE assignment_id=? ORDER BY id').all(a.id);
+  a.target_max = targetMax(a);
   if (a.reviewed_by) a.reviewer = db.prepare('SELECT name FROM users WHERE id=?').get(a.reviewed_by)?.name;
   res.json(a);
 });
@@ -717,10 +832,17 @@ app.post('/api/assignments/:id/review', mgr, (req, res) => {
   const approve = !!req.body.approve;
   const note = str(req.body.note, 500);
   if (!approve && !note) throw HttpError(400, 'Tell them what needs to be redone');
+  const failed = approve ? [] : (Array.isArray(req.body.failed_items) ? req.body.failed_items.map(int).filter(Boolean) : []);
   tx(() => {
-    db.prepare('UPDATE assignments SET status=?, reviewed_by=?, reviewed_at=?, review_note=? WHERE id=?').run(
-      approve ? 'approved' : 'rejected', req.user.id, now(), note, a.id
+    db.prepare('UPDATE assignments SET status=?, reviewed_by=?, reviewed_at=?, review_note=?, reject_count=reject_count+? WHERE id=?').run(
+      approve ? 'approved' : 'rejected', req.user.id, now(), note, approve ? 0 : 1, a.id
     );
+    db.prepare('DELETE FROM assignment_failures WHERE assignment_id=?').run(a.id);
+    for (const itemId of failed) {
+      if (db.prepare('SELECT 1 FROM assignment_checks WHERE assignment_id=? AND item_id=?').get(a.id, itemId))
+        db.prepare('INSERT OR IGNORE INTO assignment_failures (assignment_id,item_id) VALUES (?,?)').run(a.id, itemId);
+    }
+    if (!approve) db.prepare('UPDATE assignment_checks SET done=0 WHERE assignment_id=? AND item_id IN (SELECT item_id FROM assignment_failures WHERE assignment_id=?)').run(a.id, a.id);
     db.prepare("UPDATE rooms SET status=? WHERE id=? AND status<>'out_of_order'").run(approve ? 'clean' : 'dirty', a.room_id);
   });
   log(req.user.id, approve ? 'room_approved' : 'room_rejected', `Room ${a.room_number} (${a.user_name})${note ? ': ' + note : ''}`);
@@ -739,7 +861,7 @@ app.post('/api/inventory', mgr, (req, res) => {
     .prepare('INSERT INTO inventory_items (name,category,unit,qty,par,unit_cost,location) VALUES (?,?,?,?,?,?,?)')
     .run(
       name, str(req.body.category, 40) || 'General', str(req.body.unit, 20) || 'each',
-      Math.max(0, num(req.body.qty) ?? 0), Math.max(0, num(req.body.par) ?? 0),
+      Math.max(0, num(req.body.qty) ?? 0), req.user.role === 'owner' ? Math.max(0, num(req.body.par) ?? 0) : 0,
       req.user.role === 'owner' ? Math.max(0, num(req.body.unit_cost) ?? 0) : 0, str(req.body.location, 60)
     );
   const id = Number(r.lastInsertRowid);
@@ -756,7 +878,7 @@ app.patch('/api/inventory/:id', mgr, (req, res) => {
     b.name !== undefined ? str(b.name, 100) || it.name : it.name,
     b.category !== undefined ? str(b.category, 40) || it.category : it.category,
     b.unit !== undefined ? str(b.unit, 20) || it.unit : it.unit,
-    b.par !== undefined ? Math.max(0, num(b.par) ?? it.par) : it.par,
+    req.user.role === 'owner' && b.par !== undefined ? Math.max(0, num(b.par) ?? it.par) : it.par,
     req.user.role === 'owner' && b.unit_cost !== undefined ? Math.max(0, num(b.unit_cost) ?? it.unit_cost) : it.unit_cost,
     b.location !== undefined ? str(b.location, 60) : it.location,
     it.id
@@ -783,8 +905,10 @@ app.post('/api/inventory/:id/adjust', mgr, (req, res) => {
   if (it.qty + delta < 0) throw HttpError(400, `Only ${it.qty} ${it.unit} on hand`);
   tx(() => {
     db.prepare('UPDATE inventory_items SET qty=qty+? WHERE id=?').run(delta, it.id);
-    db.prepare('INSERT INTO inventory_log (item_id,user_id,delta,note) VALUES (?,?,?,?)').run(
-      it.id, req.user.id, delta, str(req.body.note, 200) || (req.body.set !== undefined ? 'Recount' : '')
+    const roomId = int(req.body.room_id);
+    db.prepare('INSERT INTO inventory_log (item_id,user_id,delta,room_id,note) VALUES (?,?,?,?,?)').run(
+      it.id, req.user.id, delta, roomId && db.prepare('SELECT 1 FROM rooms WHERE id=?').get(roomId) ? roomId : null,
+      str(req.body.note, 200) || (req.body.set !== undefined ? 'Recount' : '')
     );
   });
   res.json({ ok: true });
@@ -793,7 +917,8 @@ app.post('/api/inventory/:id/adjust', mgr, (req, res) => {
 app.get('/api/inventory/:id/log', mgr, (req, res) => {
   res.json(
     db.prepare(
-      `SELECT l.*, u.name FROM inventory_log l JOIN users u ON u.id=l.user_id WHERE l.item_id=? ORDER BY l.id DESC LIMIT 50`
+      `SELECT l.*, u.name, r.number AS room_number FROM inventory_log l JOIN users u ON u.id=l.user_id
+       LEFT JOIN rooms r ON r.id=l.room_id WHERE l.item_id=? ORDER BY l.id DESC LIMIT 50`
     ).all(int(req.params.id))
   );
 });
@@ -863,6 +988,9 @@ app.get('/api/badges', anyUser, (req, res) => {
   };
   if (req.user.role !== 'employee') {
     out.review = db.prepare("SELECT COUNT(*) c FROM assignments WHERE status='submitted'").get().c;
+    out.incidents = db.prepare("SELECT COUNT(*) c FROM incidents WHERE status='open'").get().c;
+    const urgent = db.prepare(`${INC_SELECT} WHERE i.status='open' AND i.urgent=1 ORDER BY i.id DESC LIMIT 3`).all();
+    out.alerts = urgent.map((i) => ({ id: i.id, category: i.category, reporter: i.reporter, room: i.room_number, at: i.created_at }));
   }
   res.json(out);
 });
@@ -900,14 +1028,15 @@ app.post('/api/maintenance', anyUser, upload.single('photo'), (req, res) => {
     if (!title) throw HttpError(400, 'Give the request a short title');
     const roomId = int(req.body.room_id);
     if (roomId && !db.prepare('SELECT 1 FROM rooms WHERE id=?').get(roomId)) throw HttpError(400, 'No such room');
-    const category = ['repair', 'supplies', 'safety', 'other'].includes(req.body.category) ? req.body.category : 'repair';
+    const category = ['repair', 'supplies', 'safety', 'lost_found', 'other'].includes(req.body.category) ? req.body.category : 'repair';
     const priority = ['low', 'normal', 'high', 'urgent'].includes(req.body.priority) ? req.body.priority : 'normal';
     if (req.file) name = finalizeUpload(req.file);
     const r = db
       .prepare(
-        'INSERT INTO maintenance (room_id,location,category,title,description,priority,photo,reported_by) VALUES (?,?,?,?,?,?,?,?)'
+        'INSERT INTO maintenance (room_id,location,category,title,description,priority,photo,reporting_gap,reported_by) VALUES (?,?,?,?,?,?,?,?,?)'
       )
-      .run(roomId || null, str(req.body.location, 80), category, title, str(req.body.description, 1500), priority, name || null, req.user.id);
+      .run(roomId || null, str(req.body.location, 80), category, title, str(req.body.description, 1500), priority, name || null,
+        req.user.role !== 'employee' && String(req.body.reporting_gap) === '1' ? 1 : 0, req.user.id);
     const room = roomId ? db.prepare('SELECT number FROM rooms WHERE id=?').get(roomId).number : null;
     postMessage(
       'maintenance', req.user.id,
@@ -934,7 +1063,9 @@ app.patch('/api/maintenance/:id', mgr, (req, res) => {
     if (assigned && !db.prepare('SELECT 1 FROM users WHERE id=? AND active=1').get(assigned)) throw HttpError(400, 'No such staff member');
   }
   const resolved = status === 'done' ? m.resolved_at || now() : null;
-  db.prepare('UPDATE maintenance SET status=?,priority=?,assigned_to=?,resolved_at=? WHERE id=?').run(status, priority, assigned, resolved, m.id);
+  const gap = b.reporting_gap !== undefined ? (b.reporting_gap ? 1 : 0) : m.reporting_gap;
+  db.prepare('UPDATE maintenance SET status=?,priority=?,assigned_to=?,resolved_at=?,reporting_gap=? WHERE id=?').run(status, priority, assigned, resolved, gap, m.id);
+  if (gap !== m.reporting_gap) log(req.user.id, gap ? 'reporting_gap_flagged' : 'reporting_gap_cleared', `#${m.id} ${m.title}`);
   if (status !== m.status) log(req.user.id, 'maintenance_status', `#${m.id} ${m.title}: ${m.status} → ${status}`);
   res.json({ ok: true });
 });
@@ -946,6 +1077,158 @@ app.post('/api/maintenance/:id/comments', anyUser, (req, res) => {
   if (!body) throw HttpError(400, 'Write a comment first');
   db.prepare('INSERT INTO maintenance_comments (request_id,user_id,body) VALUES (?,?,?)').run(int(req.params.id), req.user.id, body);
   res.json({ ok: true });
+});
+
+// ---------- playbook & acknowledgment ----------
+app.get('/api/playbook', anyUser, (req, res) => {
+  const signed = db.prepare('SELECT signed_name,signed_at FROM acknowledgments WHERE user_id=? AND version=?').get(req.user.id, playbook.VERSION) || null;
+  res.json({ ...playbook, signed, required: req.user.role === 'employee' && getSettings().require_ack === '1' });
+});
+
+app.post('/api/ack', anyUser, (req, res) => {
+  const typed = str(req.body.name, 100).replace(/\s+/g, ' ');
+  if (typed.toLowerCase() !== req.user.name.replace(/\s+/g, ' ').toLowerCase())
+    throw HttpError(400, `Type your full name exactly as it appears: ${req.user.name}`);
+  if (req.body.agree !== true) throw HttpError(400, 'Tick the box to confirm you have read and agree');
+  db.prepare('INSERT OR IGNORE INTO acknowledgments (user_id,version,signed_name) VALUES (?,?,?)').run(req.user.id, playbook.VERSION, typed);
+  log(req.user.id, 'acknowledgment_signed', playbook.VERSION);
+  res.json({ ok: true });
+});
+
+app.get('/api/ack/status', mgr, (_req, res) => {
+  res.json(db.prepare(
+    `SELECT u.id,u.name,u.role,a.signed_at FROM users u LEFT JOIN acknowledgments a ON a.user_id=u.id AND a.version=?
+     WHERE u.active=1 AND u.role<>'owner' ORDER BY a.signed_at IS NOT NULL, u.name`
+  ).all(playbook.VERSION));
+});
+
+// ---------- accountability log ----------
+const ACC_SELECT = `SELECT e.*, m.name AS manager, r.name AS retracted_by_name FROM accountability_events e
+  JOIN users m ON m.id=e.manager_id LEFT JOIN users r ON r.id=e.retracted_by`;
+const ZERO_TOLERANCE_CATS = ['violence', 'threat', 'harassment', 'intoxication', 'theft'];
+const STANDARDS_CATS = ['missed cleaning step', 'unreported maintenance', 'attitude with a guest', 'shift handoff', 'other standards issue'];
+
+function warningCount(userId) {
+  return db.prepare("SELECT COUNT(*) c FROM accountability_events WHERE user_id=? AND kind='warning' AND retracted_at IS NULL").get(userId).c;
+}
+
+app.get('/api/accountability/summary', mgr, (_req, res) => {
+  const rows = db.prepare("SELECT id,name,role FROM users WHERE active=1 AND role<>'owner' ORDER BY name").all();
+  for (const u of rows) {
+    u.warnings = warningCount(u.id);
+    u.zero_tolerance = db.prepare("SELECT COUNT(*) c FROM accountability_events WHERE user_id=? AND kind='zero_tolerance' AND retracted_at IS NULL").get(u.id).c;
+  }
+  res.json(rows);
+});
+
+app.get('/api/accountability', mgr, (req, res) => {
+  const uid = int(req.query.user_id);
+  if (!uid) throw HttpError(400, 'Pick an employee');
+  res.json({ warnings_used: warningCount(uid), events: db.prepare(`${ACC_SELECT} WHERE e.user_id=? ORDER BY e.event_date DESC, e.id DESC`).all(uid) });
+});
+
+// Employees can see their own record (PRD: "view own accountability record").
+app.get('/api/me/accountability', anyUser, (req, res) => {
+  res.json({ warnings_used: warningCount(req.user.id), events: db.prepare(`${ACC_SELECT} WHERE e.user_id=? ORDER BY e.event_date DESC, e.id DESC`).all(req.user.id) });
+});
+
+app.post('/api/accountability', mgr, (req, res) => {
+  const target = db.prepare("SELECT * FROM users WHERE id=? AND role<>'owner'").get(int(req.body.user_id));
+  if (!target) throw HttpError(400, 'Pick a staff member');
+  if (target.role === 'manager' && req.user.role !== 'owner') throw HttpError(403, 'Only the owner can log events against a manager');
+  const kind = req.body.kind === 'zero_tolerance' ? 'zero_tolerance' : 'warning';
+  const description = str(req.body.description, 1500);
+  if (description.length < 5) throw HttpError(400, 'Describe what happened (who, when, what)');
+  const eventDate = isYmd(req.body.event_date) ? req.body.event_date : today();
+  if (eventDate > today()) throw HttpError(400, "The date can't be in the future");
+  const prior = kind === 'warning' ? warningCount(target.id) : 0;
+  const r = db.prepare('INSERT INTO accountability_events (user_id,kind,category,description,manager_id,event_date) VALUES (?,?,?,?,?,?)')
+    .run(target.id, kind, str(req.body.category, 60), description, req.user.id, eventDate);
+  log(req.user.id, kind === 'warning' ? 'warning_logged' : 'zero_tolerance_logged', `${target.name}: ${str(req.body.category, 60)}`);
+  res.json({
+    id: Number(r.lastInsertRowid),
+    // Informational only; the decision to terminate stays with the owner.
+    repeat: prior >= 1,
+    message: prior >= 1 ? 'This is a repeat standards issue. Under the Accountability Standard a second occurrence results in termination.' : undefined,
+  });
+});
+
+app.post('/api/accountability/:id/retract', owner, (req, res) => {
+  const e = db.prepare('SELECT * FROM accountability_events WHERE id=? AND retracted_at IS NULL').get(int(req.params.id));
+  if (!e) throw HttpError(404, 'No such entry');
+  const reason = str(req.body.reason, 300);
+  if (reason.length < 3) throw HttpError(400, 'A reason is required');
+  db.prepare('UPDATE accountability_events SET retracted_at=?, retracted_by=?, retract_reason=? WHERE id=?').run(now(), req.user.id, reason, e.id);
+  log(req.user.id, 'accountability_retracted', `#${e.id}: ${reason}`);
+  res.json({ ok: true });
+});
+
+// ---------- incident reports (any staff member) ----------
+const INCIDENT_CATS = {
+  violence: true, threat: true, harassment: true, intoxication: true, theft: true, safety: true, // urgent: alerts managers at once
+  standards: false, guest_complaint: false, other: false,
+};
+const INC_SELECT = `SELECT i.*, u.name AS reporter, r.number AS room_number, rv.name AS reviewer
+  FROM incidents i JOIN users u ON u.id=i.reporter_id LEFT JOIN rooms r ON r.id=i.room_id LEFT JOIN users rv ON rv.id=i.reviewed_by`;
+
+app.post('/api/incidents', anyUser, (req, res) => {
+  const category = str(req.body.category, 30);
+  if (!(category in INCIDENT_CATS)) throw HttpError(400, 'Pick a category');
+  const description = str(req.body.description, 1500);
+  if (description.length < 3) throw HttpError(400, 'Say briefly what happened');
+  const roomId = int(req.body.room_id);
+  const r = db.prepare('INSERT INTO incidents (reporter_id,category,urgent,room_id,description) VALUES (?,?,?,?,?)').run(
+    req.user.id, category, INCIDENT_CATS[category] ? 1 : 0, roomId && db.prepare('SELECT 1 FROM rooms WHERE id=?').get(roomId) ? roomId : null, description
+  );
+  log(req.user.id, INCIDENT_CATS[category] ? 'URGENT_incident_reported' : 'incident_reported', `${category}: ${description.slice(0, 80)}`);
+  res.json({ id: Number(r.lastInsertRowid), urgent: INCIDENT_CATS[category] });
+});
+
+app.get('/api/incidents', anyUser, (req, res) => {
+  if (req.user.role === 'employee') {
+    return res.json(db.prepare(`${INC_SELECT} WHERE i.reporter_id=? ORDER BY i.id DESC LIMIT 50`).all(req.user.id));
+  }
+  const status = req.query.status === 'all' ? '1=1' : "i.status='open'";
+  res.json(db.prepare(`${INC_SELECT} WHERE ${status} ORDER BY i.status, i.urgent DESC, i.id DESC LIMIT 100`).all());
+});
+
+app.post('/api/incidents/:id/review', mgr, (req, res) => {
+  const i = db.prepare('SELECT * FROM incidents WHERE id=?').get(int(req.params.id));
+  if (!i) throw HttpError(404, 'No such report');
+  db.prepare("UPDATE incidents SET status='reviewed', reviewed_by=?, reviewed_at=?, review_note=? WHERE id=?").run(req.user.id, now(), str(req.body.note, 500), i.id);
+  log(req.user.id, 'incident_reviewed', `#${i.id} ${i.category}`);
+  res.json({ ok: true });
+});
+
+// ---------- employee pattern view ----------
+app.get('/api/employees/:id/timeline', mgr, (req, res) => {
+  const u = db.prepare('SELECT id,name,role,phone FROM users WHERE id=?').get(int(req.params.id));
+  if (!u) throw HttpError(404, 'No such person');
+  const since = addDays(today(), -30);
+  const rejections = db.prepare(
+    `SELECT a.id,a.date,r.number AS room_number,a.review_note,a.reject_count FROM assignments a JOIN rooms r ON r.id=a.room_id
+     WHERE a.user_id=? AND a.reject_count>0 AND a.date>=? ORDER BY a.date DESC`
+  ).all(u.id, since);
+  const patterns = db.prepare(
+    `SELECT i.text, COUNT(*) AS times FROM assignment_failures f JOIN assignments a ON a.id=f.assignment_id
+     JOIN checklist_items i ON i.id=f.item_id WHERE a.user_id=? AND a.date>=? GROUP BY i.id HAVING times>=3 ORDER BY times DESC`
+  ).all(u.id, since);
+  const s = db.prepare(
+    `SELECT COUNT(*) AS reviewed, SUM(status='approved' AND reject_count=0) AS first_pass,
+      AVG(CASE WHEN started_at IS NOT NULL AND submitted_at IS NOT NULL THEN (julianday(submitted_at)-julianday(started_at))*1440 END) AS avg_minutes
+     FROM assignments WHERE user_id=? AND date>=? AND (status='approved' OR reject_count>0)`
+  ).get(u.id, since);
+  const clock = entriesFor(since, today(), u.id);
+  res.json({
+    user: u, since,
+    stats: { reviewed: s.reviewed, first_pass: s.first_pass || 0, avg_minutes: s.avg_minutes == null ? null : Math.round(s.avg_minutes) },
+    rejections, patterns,
+    clock_flags: clock.filter((e) => e.flags.length).map((e) => ({ id: e.id, clock_in: e.clock_in, flags: e.flags })),
+    warnings_used: warningCount(u.id),
+    events: db.prepare(`${ACC_SELECT} WHERE e.user_id=? ORDER BY e.event_date DESC, e.id DESC`).all(u.id),
+    incidents: db.prepare(`${INC_SELECT} WHERE i.reporter_id=? ORDER BY i.id DESC LIMIT 10`).all(u.id),
+    signed: !!hasSigned(u.id),
+  });
 });
 
 // ---------- dashboard & reports ----------
@@ -972,11 +1255,46 @@ app.get('/api/dashboard', mgr, (req, res) => {
 
   const clockedIn = db
     .prepare(
-      `SELECT c.id,c.clock_in,u.name,u.role FROM clock_entries c JOIN users u ON u.id=c.user_id WHERE c.clock_out IS NULL ORDER BY c.clock_in`
+      `SELECT c.id,c.user_id,c.clock_in,u.name,u.role FROM clock_entries c JOIN users u ON u.id=c.user_id
+       WHERE c.clock_out IS NULL AND c.voided=0 ORDER BY c.clock_in`
     )
     .all();
   const forgotLimit = Number(s.forgotten_clockout_hours) || 14;
-  clockedIn.forEach((c) => (c.suspicious = hoursBetween(c.clock_in, now()) > forgotLimit));
+  const factor = Number(s.behind_factor) || 1.25;
+  let behindCount = 0;
+  for (const c of clockedIn) {
+    c.suspicious = hoursBetween(c.clock_in, now()) > forgotLimit;
+    const active = db.prepare(`${ASSIGN_SELECT} WHERE a.user_id=? AND a.status='in_progress' ORDER BY a.started_at DESC LIMIT 1`).get(c.user_id);
+    const total = db.prepare("SELECT COUNT(*) c FROM assignments WHERE user_id=? AND date=?").get(c.user_id, t).c;
+    const done = db.prepare("SELECT COUNT(*) c FROM assignments WHERE user_id=? AND date=? AND status IN ('submitted','approved')").get(c.user_id, t).c;
+    c.rooms_total = total; c.rooms_done = done;
+    c.task = active ? `Room ${active.room_number}` : null;
+    const tgt = active ? targetMax(active, s) : null;
+    const mins = active?.started_at ? hoursBetween(active.started_at, now()) * 60 : 0;
+    const onBreak = !!db.prepare('SELECT 1 FROM breaks WHERE entry_id=? AND end_at IS NULL').get(c.id);
+    c.status = onBreak ? 'On Break' : tgt && mins > tgt * factor ? 'Behind Schedule' : active ? 'On Task' : 'Clocked in';
+    if (c.status === 'Behind Schedule') behindCount++;
+  }
+  const todayEntries = entriesFor(t, t);
+  const attention = [];
+  todayEntries.forEach((e) => e.flags.forEach((f) => attention.push({ type: 'clock', text: `${e.name}: ${f}` })));
+  const openGaps = db.prepare("SELECT COUNT(*) c FROM maintenance WHERE reporting_gap=1 AND status<>'done'").get().c;
+  if (openGaps) attention.push({ type: 'gap', text: `${openGaps} open maintenance item(s) flagged as Reporting Gap`, href: '#/maint' });
+  const unsigned = db.prepare(
+    `SELECT COUNT(*) c FROM users u WHERE u.active=1 AND u.role<>'owner' AND NOT EXISTS (SELECT 1 FROM acknowledgments a WHERE a.user_id=u.id AND a.version=?)`
+  ).get(playbook.VERSION).c;
+  if (unsigned) attention.push({ type: 'ack', text: `${unsigned} staff member(s) have not signed the Employee Acknowledgment`, href: '#/team' });
+  const openInc = db.prepare("SELECT COUNT(*) c FROM incidents WHERE status='open'").get().c;
+  if (openInc) attention.push({ type: 'incident', text: `${openInc} incident report(s) waiting for review`, href: '#/incidents' });
+  if (behindCount) attention.push({ type: 'behind', text: `${behindCount} housekeeper(s) behind schedule on a room`, href: '#/home' });
+
+  const interval = Number(s.deep_clean_interval_days) || 90;
+  const deepDue = db.prepare(
+    `SELECT r.id,r.number,
+      (SELECT MAX(a.date) FROM assignments a WHERE a.room_id=r.id AND a.clean_type='deep' AND a.status IN ('submitted','approved')) AS last_deep
+     FROM rooms r WHERE r.active=1 AND r.status<>'out_of_order'`
+  ).all().filter((r) => !r.last_deep || r.last_deep <= addDays(t, -interval))
+    .sort((a, b) => (a.last_deep || '').localeCompare(b.last_deep || '')).slice(0, 12);
 
   const week = hoursReport(weekStart(t), t, isOwner);
   const dayHours = r2(week.users.reduce((a, u) => a + (u.days[t] || 0), 0));
@@ -997,7 +1315,7 @@ app.get('/api/dashboard', mgr, (req, res) => {
   const pending = db.prepare(`${ASSIGN_SELECT} WHERE a.status='submitted' ORDER BY a.submitted_at LIMIT 20`).all();
 
   const out = {
-    today: t, roomCounts, assignCounts, unassigned, clockedIn, dayHours,
+    today: t, roomCounts, assignCounts, unassigned, clockedIn, dayHours, attention, deepDue, deepIntervalDays: interval,
     weekHours: week.totals.hours, weekOvertime: week.totals.overtime,
     lowStock, maintCounts, maintTop, pending,
   };
@@ -1010,24 +1328,28 @@ app.get('/api/dashboard', mgr, (req, res) => {
   res.json(out);
 });
 
-// Quality & speed per housekeeper over a date range
+// Quality & speed per housekeeper. "First-pass" = approved without ever being sent back (the SOP's inspection pass rate).
 app.get('/api/reports/productivity', mgr, (req, res) => {
   const { from, to } = rangeFromQuery(req.query);
   const rows = db
     .prepare(
       `SELECT u.id,u.name,
         COUNT(*) AS rooms,
-        SUM(a.status='approved') AS approved,
-        SUM(a.status='rejected') AS rejected,
+        SUM(a.status='approved' AND a.reject_count=0) AS first_pass,
+        SUM(a.reject_count) AS sent_back,
         AVG(CASE WHEN a.started_at IS NOT NULL AND a.submitted_at IS NOT NULL
           THEN (julianday(a.submitted_at)-julianday(a.started_at))*1440 END) AS avg_minutes
        FROM assignments a JOIN users u ON u.id=a.user_id
-       WHERE a.date BETWEEN ? AND ? AND a.status IN ('submitted','approved','rejected')
+       WHERE a.date BETWEEN ? AND ? AND (a.status='approved' OR a.reject_count>0)
        GROUP BY u.id ORDER BY u.name`
     )
     .all(from, to)
-    .map((r) => ({ ...r, avg_minutes: r.avg_minutes == null ? null : Math.round(r.avg_minutes) }));
-  res.json({ from, to, users: rows });
+    .map((r) => ({
+      ...r, first_pass: r.first_pass || 0, sent_back: r.sent_back || 0,
+      pass_rate: r.rooms ? Math.round(((r.first_pass || 0) / r.rooms) * 100) : null,
+      avg_minutes: r.avg_minutes == null ? null : Math.round(r.avg_minutes),
+    }));
+  res.json({ from, to, pass_rate_target: Number(getSettings().pass_rate_target) || 95, users: rows });
 });
 
 // ---------- settings (owner) ----------
@@ -1044,6 +1366,17 @@ app.put('/api/settings', owner, (req, res) => {
   if (b.min_photos !== undefined) up.run('min_photos', String(Math.min(10, Math.max(0, int(b.min_photos) ?? 1))));
   if (b.require_clock_in !== undefined) up.run('require_clock_in', b.require_clock_in ? '1' : '0');
   if (b.overtime_weekly_hours !== undefined) up.run('overtime_weekly_hours', String(Math.max(1, num(b.overtime_weekly_hours) ?? 40)));
+  const numSetting = (key, min, max) => {
+    if (b[key] === undefined) return;
+    const v = num(b[key]);
+    if (v === null || v < min || v > max) throw HttpError(400, `${key.replace(/_/g, ' ')} must be between ${min} and ${max}`);
+    up.run(key, String(v));
+  };
+  numSetting('max_break_minutes', 1, 240); numSetting('target_checkout_max', 5, 240); numSetting('target_stayover_max', 5, 240);
+  numSetting('target_suite_max', 5, 240); numSetting('behind_factor', 1, 5); numSetting('deep_clean_interval_days', 7, 730);
+  numSetting('pass_rate_target', 1, 100); numSetting('forgotten_clockout_hours', 6, 48);
+  if (b.break_unpaid !== undefined) up.run('break_unpaid', b.break_unpaid ? '1' : '0');
+  if (b.require_ack !== undefined) up.run('require_ack', b.require_ack ? '1' : '0');
   log(req.user.id, 'settings_changed');
   res.json({ ok: true });
 });
