@@ -1,0 +1,29 @@
+{
+  "name": "stay-flow",
+  "version": "1.0.0",
+  "description": "Heidi's Inn housekeeping, hours, inventory and maintenance manager",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "demo": "SEED_DEMO=1 node src/server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bchelsea503-prog/Stay-flow.git"
+  },
+  "bugs": {
+    "url": "https://github.com/bchelsea503-prog/Stay-flow/issues"
+  },
+  "homepage": "https://github.com/bchelsea503-prog/Stay-flow#readme",
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cookie-parser": "^1.4.7",
+    "express": "^4.22.3",
+    "multer": "^1.4.4"
+  },
+  "private": true,
+  "engines": {
+    "node": ">=22.13"
+  }
+}
