@@ -167,3 +167,4 @@ li.retracted { opacity: .55; } li.retracted b { text-decoration: line-through; }
 }
 .toast { border-radius: 14px; text-align: center; }
 @media (max-width: 520px) { .top .who { display: none; } .brand { white-space: nowrap; } }
+.ok-text{color:var(--ok);font-weight:600}

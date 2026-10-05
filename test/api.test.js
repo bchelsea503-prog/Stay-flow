@@ -204,6 +204,66 @@ test('full workflow with role enforcement', async () => {
   assert.equal((await m.post(`/api/incidents/${inc.data.id}/review`, { note: 'Spoke with guest' })).status, 200);
   assert.equal((await m.get('/api/badges')).data.alerts.length, 0);
 
+  // ---- text + email alerts to the owner and the GM ----
+  const { notify } = require('../src/server');
+  const sentMail = [], sentSms = [];
+  let smsDown = false;
+  notify.setTransports({
+    email: async (m) => { sentMail.push(m); },
+    sms: async (m) => { if (smsDown) throw new Error('Twilio 503'); sentSms.push(m); },
+  });
+  Object.assign(process.env, { SMTP_HOST: 'smtp.test', SMTP_FROM: 'alerts@heidis.test', TWILIO_ACCOUNT_SID: 'ACx', TWILIO_AUTH_TOKEN: 'sekret-token-123', SMTP_PASS: 'smtp-pass-456', TWILIO_FROM: '+15555550100', APP_URL: 'https://ops.test' });
+  const settle = () => new Promise((r) => setTimeout(r, 150));
+
+  assert.equal((await e.patch('/api/me/contact', { email: 'a@b.co' })).status, 403, 'employees do not set alert contacts');
+  assert.equal((await e.get('/api/notify/status')).status, 403);
+  assert.equal((await o.patch('/api/me/contact', { phone: '12345' })).status, 400, 'needs country code');
+  assert.equal((await o.patch('/api/me/contact', { email: 'not-an-email' })).status, 400);
+  assert.equal((await o.patch('/api/me/contact', { email: 'owner@heidis.test', phone: '+7 912 345 67 89' })).status, 200);
+  assert.equal((await m.patch('/api/me/contact', { email: 'gm@heidis.test', phone: '(360) 555-0123' })).status, 200);
+
+  // before any incident, the test button reaches the person who pressed it
+  const t1 = await o.post('/api/notify/test');
+  assert.deepEqual(t1.data.results.map((x) => x.status).sort(), ['sent', 'sent']);
+  assert.equal(sentSms.at(-1).to, '+79123456789');
+  sentMail.length = 0; sentSms.length = 0;
+
+  const inc2 = await z.post('/api/incidents', { category: 'threat', room_id: rooms[1].id, description: 'Guest threatened to hurt me in the hallway' });
+  assert.equal(inc2.status, 200, 'reporter is never blocked by delivery');
+  await settle();
+  assert.deepEqual(sentMail.map((x) => x.to).sort(), ['gm@heidis.test', 'owner@heidis.test']);
+  assert.deepEqual(sentSms.map((x) => x.to).sort(), ['+13605550123', '+79123456789']);
+  assert.match(sentMail[0].subject, /URGENT.*Threat.*Room 102/);
+  assert.match(sentMail[0].text, /threatened to hurt me/, 'email carries the details');
+  assert.ok(!/threatened/.test(sentSms[0].text), 'text message leaves out the details');
+  assert.match(sentSms[0].text, /https:\/\/ops\.test\/#\/incidents/);
+
+  await z.post('/api/incidents', { category: 'standards', description: 'Missed handoff note' });
+  await settle();
+  assert.equal(sentMail.length, 2, 'non-urgent reports do not alert');
+
+  // one reminder when nobody reviews it
+  const { db: rawDb } = require('../src/db');
+  rawDb.prepare('UPDATE incidents SET created_at=? WHERE id=?').run(new Date(Date.now() - 3600000).toISOString(), inc2.data.id);
+  sentMail.length = 0; sentSms.length = 0;
+  assert.equal(await notify.sendDueReminders(), 1);
+  assert.equal(sentMail.length, 2);
+  assert.match(sentMail[0].subject, /REMINDER/);
+  assert.equal(await notify.sendDueReminders(), 0, 'only one reminder');
+  await m.post(`/api/incidents/${inc2.data.id}/review`, { note: 'handled' });
+
+  // a provider outage is recorded and surfaced, not hidden
+  smsDown = true;
+  const inc3 = await z.post('/api/incidents', { category: 'safety', description: 'Space heater sparking in 103' });
+  assert.equal(inc3.status, 200);
+  await settle();
+  const st = (await m.get('/api/notify/status')).data;
+  assert.ok(st.log.some((x) => x.channel === 'sms' && x.status === 'failed' && /503/.test(x.detail)));
+  assert.equal(st.configured.email, true);
+  assert.ok(!/sekret-token-123|smtp-pass-456|ACx/.test(JSON.stringify(st)), 'status never exposes credentials');
+  assert.ok((await o.get('/api/dashboard')).data.attention.some((x) => /failed to send/.test(x.text)));
+  smsDown = false;
+
   // reporting gap flag is manager-only
   const gapReq = await e.form('/api/maintenance', photoForm({ title: 'Dripping tap', reporting_gap: '1' }));
   assert.equal((await o.get('/api/maintenance/' + gapReq.data.id)).data.reporting_gap, 0);

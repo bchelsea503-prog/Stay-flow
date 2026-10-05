@@ -76,6 +76,30 @@ Put HTTPS in front (the hosts above do this for you; or Caddy/nginx on a VPS). S
 
 **Please test access from Russia before relying on it.** Some foreign hosting domains are blocked or throttled there. A custom domain pointing at a host/VPS in a neutral region (e.g. Europe) is usually the safest choice. The owner should also download a backup regularly (*Settings → Download backup*; photos live in `DATA_DIR/uploads`, so snapshot that disk too).
 
+## Urgent alerts by text and email
+
+When any staff member files an **urgent** incident (violence, threat, harassment, intoxication, theft, safety), the owner and every manager (the GM) get an **email and a text**, and **one reminder** if nobody has reviewed it after 15 minutes (changeable in Settings; 0 turns it off). The red in-app banner still shows too. Non-urgent reports don't send anything.
+
+- Each person sets their own email and mobile number under **Me → Urgent alerts**, then taps **Send test alert**. The owner can also set a manager's email under Team.
+- Mobile numbers need a country code (`+7 912 345 67 89`, `+1 360 555 0123`).
+- Texts are deliberately short and leave out what happened (names, details); the email and the app have the full report.
+- Reporting an incident never waits on, or fails because of, a text/email problem. Every attempt (sent, failed, skipped and why) is listed in **Settings → Urgent alerts**, and a failure in the last 24 hours shows up under "Needs attention" on the dashboard. The owner's dashboard also warns if nobody can currently be reached.
+
+**Server setup** (secrets go in environment variables, never in the app):
+
+```bash
+# Email: any SMTP service (Gmail with an app password, Postmark, Mailgun, SendGrid, ...)
+SMTP_HOST=smtp.example.com  SMTP_PORT=587  SMTP_USER=...  SMTP_PASS=...  SMTP_FROM="Heidi's Inn <alerts@yourdomain.com>"
+# Texts: Twilio
+TWILIO_ACCOUNT_SID=AC...  TWILIO_AUTH_TOKEN=...  TWILIO_FROM=+13605550100   # or TWILIO_MESSAGING_SERVICE_SID=MG...
+# Used for the link inside alerts
+APP_URL=https://heidisinn-ops.com
+```
+
+Add them to `docker run` with `-e` (or an env file), e.g. `docker run ... --env-file stayflow.env stayflow`.
+
+**Be realistic about texts to Russia.** Email is the dependable channel. Text messages from US numbers to Russian mobiles are often filtered or blocked by carriers and Twilio's Russia rules (sender registration) change, so send a test to the owner's real number *before* relying on it, and keep email on. For US recipients, Twilio requires registering your messaging use case (A2P 10DLC, or toll-free verification) before texts are delivered reliably; that takes a few days, so start it early. If the owner's phone is the weak link, a Telegram or WhatsApp channel is a good alternative to add.
+
 ## First-day setup (owner)
 
 1. Settings: confirm property name, timezone, photos-per-room.
@@ -90,7 +114,7 @@ Put HTTPS in front (the hosts above do this for you; or Caddy/nginx on a VPS). S
 
 ## Not built yet
 
-- **Real push notifications.** Urgent incidents show as a red banner on every manager screen within ~10 seconds while the app is open; there's no phone push/SMS/email yet when the app is closed. This is the most important gap for an owner overseas (Web Push or SMS would fix it).
+- **Phone push notifications** (the app icon buzzing). Urgent incidents are sent by text and email, and show as a red banner within ~10 seconds while the app is open. Other events (e.g. a submitted room, low stock) don't send alerts yet.
 - **Offline sync** for checklist/clock actions on carts with poor signal (PRD section 7). Today the app needs a connection; the shell loads offline but actions fail with a clear message.
 - **Schedule-based flags** (clock-in before/after scheduled shift, late clock-ins) because there is no shift-schedule module.
 - **PRD modules outside this build:** check-in/out and revenue on the Today screen, Market Watch, AI review responses and AI insight cards (the "current build" they carry forward from wasn't available to me). Guest-complaint rate (<2%) and missed departures need booking data, so they aren't tracked.

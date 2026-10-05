@@ -311,18 +311,19 @@ function userModal(u, done) {
   modal(u ? u.name : 'Add person', (body, close) => {
     const f = {
       name: h('input', { value: u?.name || '' }), username: h('input', { value: u?.username || '', disabled: !!u, autocapitalize: 'none', placeholder: 'login name' }),
-      phone: h('input', { value: u?.phone || '', type: 'tel' }), pass: h('input', { type: 'text', autocomplete: 'off', placeholder: u ? 'Leave blank to keep' : 'At least 6 characters' }),
+      phone: h('input', { value: u?.phone || '', type: 'tel', placeholder: '+1 360 555 0123' }), email: h('input', { value: u?.email || '', type: 'email', placeholder: 'for urgent alerts' }), pass: h('input', { type: 'text', autocomplete: 'off', placeholder: u ? 'Leave blank to keep' : 'At least 6 characters' }),
       rate: h('input', { type: 'number', step: '0.01', min: 0, value: u?.hourly_rate ?? 0 }),
       role: h('select', null, ['employee', 'manager'].map((r) => h('option', { value: r, selected: u?.role === r }, r))),
     };
-    body.append(h('div', { class: 'form' }, h('label', null, 'Full name', f.name), h('label', null, 'Username', f.username), h('label', null, 'Phone', f.phone),
+    body.append(h('div', { class: 'form' }, h('label', null, 'Full name', f.name), h('label', null, 'Username', f.username), h('label', null, 'Mobile (with country code)', f.phone),
+      isOwner() && h('label', null, 'Email (managers get urgent alerts here)', f.email),
       isOwner() && h('div', { class: 'grid2' }, h('label', null, 'Role', f.role), h('label', null, 'Hourly rate ($)', f.rate)),
       h('label', null, u ? 'Reset password' : 'Password', f.pass),
       h('div', { class: 'row between' },
         u ? h('button', { class: 'btn ' + (u.active ? 'danger' : ''), onclick: async () => { if (await attempt(() => PATCH('/api/users/' + u.id, { active: !u.active }), u.active ? 'Deactivated' : 'Reactivated')) { close(); done(); } } }, u.active ? 'Deactivate' : 'Reactivate') : h('span'),
         h('button', { class: 'btn primary', onclick: async () => {
           const p = { name: f.name.value, phone: f.phone.value };
-          if (isOwner()) { p.hourly_rate = f.rate.value; p.role = f.role.value; }
+          if (isOwner()) { p.hourly_rate = f.rate.value; p.role = f.role.value; p.email = f.email.value; }
           if (f.pass.value) p.password = f.pass.value;
           const r = await attempt(() => (u ? PATCH('/api/users/' + u.id, p) : POST('/api/users', { ...p, username: f.username.value, password: f.pass.value, role: isOwner() ? f.role.value : 'employee' })), 'Saved');
           if (r) { close(); done(); }
@@ -390,7 +391,9 @@ export async function settingsView(root) {
     behind: h('input', { type: 'number', step: '0.05', min: 1, value: s.behind_factor }),
     deep: h('input', { type: 'number', min: 7, value: s.deep_clean_interval_days }),
     pass: h('input', { type: 'number', min: 1, max: 100, value: s.pass_rate_target }),
+    remind: h('input', { type: 'number', min: 0, max: 240, value: s.alert_reminder_minutes }),
   };
+  const ns = await GET('/api/notify/status');
   root.append(h('h2', null, 'Settings'),
     h('datalist', { id: 'tzs' }, ['America/Los_Angeles', 'America/Denver', 'America/Chicago', 'America/New_York'].map((z) => h('option', { value: z }))),
     h('form', { class: 'card form', onsubmit: async (e) => {
@@ -398,7 +401,7 @@ export async function settingsView(root) {
       if (await attempt(() => PUT('/api/settings', { property_name: f.name.value, timezone: f.tz.value, min_photos: f.photos.value, overtime_weekly_hours: f.ot.value, require_clock_in: f.clock.checked,
         require_ack: f.ack.checked, break_unpaid: f.unpaid.checked, max_break_minutes: f.maxBreak.value, target_checkout_max: f.tCheckout.value,
         target_stayover_max: f.tStay.value, target_suite_max: f.tSuite.value, behind_factor: f.behind.value, deep_clean_interval_days: f.deep.value,
-        pass_rate_target: f.pass.value }), 'Settings saved')) setTimeout(() => location.reload(), 600);
+        pass_rate_target: f.pass.value, alert_reminder_minutes: f.remind.value }), 'Settings saved')) setTimeout(() => location.reload(), 600);
     } },
       h('label', null, 'Property name', f.name), h('label', null, 'Property timezone (Ilwaco, WA = America/Los_Angeles)', f.tz),
       h('label', null, 'Photos required per room', f.photos), h('label', null, 'Overtime after (hours per week)', f.ot),
@@ -408,7 +411,26 @@ export async function settingsView(root) {
       h('h3', null, 'SOP targets'),
       h('div', { class: 'grid2' }, h('label', null, 'Checkout max (min)', f.tCheckout), h('label', null, 'Stayover max (min)', f.tStay), h('label', null, 'Kitchen/suite max (min)', f.tSuite), h('label', null, '"Behind schedule" at × target', f.behind)),
       h('div', { class: 'grid2' }, h('label', null, 'Deep clean every (days)', f.deep), h('label', null, 'Inspection pass-rate goal (%)', f.pass)),
+      h('label', null, 'Re-send an unreviewed urgent alert after (minutes, 0 = never)', f.remind),
       h('button', { class: 'btn primary' }, 'Save settings')),
+    alertsCard(ns),
     h('section', { class: 'card' }, h('h3', null, 'Backup'), h('p', { class: 'muted' }, 'Download a full copy of your data (staff, hours, rooms, inventory). Photos are kept on the server.'),
       h('a', { class: 'btn', href: '/api/backup', download: '' }, '⬇ Download backup')));
+}
+
+function alertsCard(ns) {
+  const ok = (v) => (v ? pill('ok', 'ready') : pill('warn', 'not ready'));
+  return h('section', { class: 'card' }, h('h3', null, '🚨 Urgent text & email alerts'),
+    h('p', { class: 'muted small' }, 'Sent to the owner and every manager the moment an urgent incident is filed. Each person sets their own email and mobile number under Me.'),
+    h('div', { class: 'row between' }, h('span', null, 'Email service'), ns.configured.email ? pill('ok', 'connected') : pill('bad', 'not set up')),
+    h('div', { class: 'row between' }, h('span', null, 'Text-message service'), ns.configured.sms ? pill('ok', 'connected') : pill('bad', 'not set up')),
+    (!ns.configured.email || !ns.configured.sms) && h('p', { class: 'note' }, 'The server needs the provider details added (SMTP_* for email, TWILIO_* for texts). See the README, "Urgent alerts".'),
+    h('h4', null, 'Who gets alerted'),
+    h('ul', { class: 'list tight' }, ns.recipients.map((r) => h('li', null,
+      h('span', null, h('b', null, r.name), ' ', h('span', { class: 'muted small' }, r.role)),
+      h('span', null, 'email ', ok(r.email_ready), ' text ', ok(r.sms_ready))))),
+    h('h4', null, 'Recent deliveries'),
+    ns.log.length ? h('ul', { class: 'list tight' }, ns.log.map((n) => h('li', null,
+      h('span', null, `${n.channel === 'sms' ? 'Text' : 'Email'} to ${n.name || '?'} (${n.kind}): `, h('b', { class: n.status === 'sent' ? '' : n.status === 'failed' ? 'bad-text' : 'warn-text' }, n.status), n.detail ? ' · ' + n.detail : ''),
+      h('span', { class: 'muted small' }, ago(n.created_at))))) : h('p', { class: 'muted small' }, 'Nothing sent yet. Use "Send test alert" under Me.'));
 }

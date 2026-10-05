@@ -234,7 +234,32 @@ CREATE TABLE IF NOT EXISTS activity (
 );
 `);
 
+// Lightweight migrations so an existing database picks up new columns.
+function addColumn(table, column, ddl) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (!cols.some((c) => c.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+}
+addColumn('users', 'email', "TEXT NOT NULL DEFAULT ''");
+addColumn('users', 'alert_sms', 'INTEGER NOT NULL DEFAULT 1');
+addColumn('users', 'alert_email', 'INTEGER NOT NULL DEFAULT 1');
+addColumn('incidents', 'reminded_at', 'TEXT');
+
+// Record of every alert attempt, so a failed text or email is visible, not silent.
+db.exec(`
+CREATE TABLE IF NOT EXISTS notifications (
+  id INTEGER PRIMARY KEY,
+  incident_id INTEGER REFERENCES incidents(id),
+  user_id INTEGER REFERENCES users(id),
+  channel TEXT NOT NULL CHECK (channel IN ('sms','email')),
+  kind TEXT NOT NULL DEFAULT 'alert',
+  status TEXT NOT NULL CHECK (status IN ('sent','failed','skipped')),
+  detail TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+`);
+
 const DEFAULT_SETTINGS = {
+  alert_reminder_minutes: '15',
   property_name: "Heidi's Inn",
   timezone: 'America/Los_Angeles',
   min_photos: '1',

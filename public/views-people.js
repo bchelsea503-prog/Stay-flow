@@ -1,5 +1,5 @@
 import {
-  S, h, GET, POST, attempt, toast, modal, confirmBox, fmtDateTime, fmtDay, ago, pill,
+  S, h, GET, POST, PATCH, attempt, toast, modal, confirmBox, fmtDateTime, fmtDay, ago, pill,
 } from './util.js';
 
 const isMgr = () => S.me.role !== 'employee';
@@ -90,6 +90,7 @@ export async function accountView(root) {
   root.append(h('h2', null, 'My account'),
     h('section', { class: 'card' }, h('b', null, S.me.name), h('div', { class: 'muted' }, `@${S.me.username} · ${S.me.role}`)),
     h('a', { class: 'card link', href: '#/playbook' }, '📘 SOP Playbook & my signed acknowledgment'));
+  if (isMgr()) root.append(alertContactCard());
   if (S.me.role !== 'owner') {
     root.append(h('section', { class: 'card' }, h('h3', null, 'My record'),
       h('p', null, `Standards warnings: ${rec.warnings_used} of 1 used`),
@@ -166,4 +167,34 @@ function retractModal(e, done) {
     body.append(h('div', { class: 'form' }, h('p', null, 'The entry stays visible, marked as retracted, and no longer counts toward the warning limit.'), reason,
       h('button', { class: 'btn danger', onclick: async () => { if (await attempt(() => POST(`/api/accountability/${e.id}/retract`, { reason: reason.value }), 'Retracted')) { close(); done(); } } }, 'Retract')));
   });
+}
+
+// ================= urgent text + email alerts (owner / managers) =================
+function alertContactCard() {
+  const email = h('input', { type: 'email', value: S.me.email || '', placeholder: 'you@example.com', autocomplete: 'email' });
+  const phone = h('input', { type: 'tel', value: S.me.phone || '', placeholder: '+7 912 345 67 89 or +1 360 555 0123', autocomplete: 'tel' });
+  const sms = h('input', { type: 'checkbox', checked: !!S.me.alert_sms });
+  const em = h('input', { type: 'checkbox', checked: !!S.me.alert_email });
+  const result = h('div', { class: 'small' });
+  const save = async () => {
+    const ok = await attempt(() => PATCH('/api/me/contact', { email: email.value, phone: phone.value, alert_sms: sms.checked, alert_email: em.checked }), 'Alert contacts saved');
+    if (ok) Object.assign(S.me, { email: email.value, phone: phone.value, alert_sms: sms.checked, alert_email: em.checked });
+    return ok;
+  };
+  return h('section', { class: 'card' }, h('h3', null, '🚨 Urgent alerts to my phone and email'),
+    h('p', { class: 'muted small' }, 'When anyone reports violence, a threat, harassment, intoxication, theft or a safety emergency, you get a text and an email right away, and one reminder if nobody has reviewed it. Use your mobile number with its country code.'),
+    h('div', { class: 'form' },
+      h('label', null, 'Email', email), h('label', null, 'Mobile number (with country code)', phone),
+      h('label', { class: 'inline' }, em, ' Send me email alerts'), h('label', { class: 'inline' }, sms, ' Send me text alerts'),
+      h('div', { class: 'row' },
+        h('button', { class: 'btn primary grow', onclick: save }, 'Save'),
+        h('button', { class: 'btn grow', onclick: async () => {
+          if (!(await save())) return;
+          result.textContent = 'Sending…';
+          const r = await attempt(() => POST('/api/notify/test'));
+          if (!r) return (result.textContent = '');
+          result.replaceChildren(...r.results.map((x) => h('div', { class: x.status === 'sent' ? 'ok-text' : 'bad-text' },
+            `${x.channel === 'sms' ? 'Text' : 'Email'}: ${x.status === 'sent' ? 'sent. Check your phone/inbox.' : x.status + (x.detail ? ': ' + x.detail : '')}`)));
+        } }, 'Send test alert')),
+      result));
 }

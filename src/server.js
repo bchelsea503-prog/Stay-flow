@@ -9,6 +9,7 @@ const path = require('path');
 const { db, tx, log, getSettings, UPLOAD_DIR, DATA_DIR, CHANNELS } = require('./db');
 const { localDate, addDays, weekStart, isYmd, hoursBetween } = require('./time');
 const playbook = require('./playbook');
+const notify = require('./notify');
 
 const app = express();
 app.set('trust proxy', process.env.TRUST_PROXY === '0' ? false : 1);
@@ -76,7 +77,7 @@ function loadUser(req, _res, next) {
   if (token) {
     const row = db
       .prepare(
-        `SELECT u.id,u.name,u.username,u.role,u.active,u.phone,u.hourly_rate FROM sessions s JOIN users u ON u.id=s.user_id
+        `SELECT u.id,u.name,u.username,u.role,u.active,u.phone,u.email,u.alert_sms,u.alert_email,u.hourly_rate FROM sessions s JOIN users u ON u.id=s.user_id
          WHERE s.token_hash=? AND s.expires_at>?`
       )
       .get(sha(token), now());
@@ -122,10 +123,10 @@ app.post('/api/logout', (req, res) => {
 });
 
 app.get('/api/me', anyUser, (req, res) => {
-  const { id, name, username, role, phone } = req.user;
+  const { id, name, username, role, phone, email, alert_sms, alert_email } = req.user;
   const s = getSettings();
   res.json({
-    user: { id, name, username, role, phone },
+    user: { id, name, username, role, phone, email, alert_sms: !!alert_sms, alert_email: !!alert_email },
     settings: {
       property_name: s.property_name,
       timezone: s.timezone,
@@ -135,6 +136,41 @@ app.get('/api/me', anyUser, (req, res) => {
     today: today(),
     channels: CHANNELS.map((c) => ({ ...c, canPost: c.postRoles.includes(role) })),
   });
+});
+
+// Owner and managers set where their own urgent alerts go.
+app.patch('/api/me/contact', mgr, (req, res) => {
+  const b = req.body;
+  const email = b.email !== undefined ? str(b.email, 200) : req.user.email;
+  if (email && !notify.validEmail(email)) throw HttpError(400, 'That email address does not look right');
+  let phone = b.phone !== undefined ? str(b.phone, 40) : req.user.phone;
+  if (phone && !notify.normalizePhone(phone)) throw HttpError(400, 'Enter the mobile number with its country code, e.g. +7 912 345 67 89 or +1 360 555 0123');
+  const sms = b.alert_sms !== undefined ? (b.alert_sms ? 1 : 0) : req.user.alert_sms;
+  const em = b.alert_email !== undefined ? (b.alert_email ? 1 : 0) : req.user.alert_email;
+  db.prepare('UPDATE users SET email=?,phone=?,alert_sms=?,alert_email=? WHERE id=?').run(email, phone, sms, em, req.user.id);
+  log(req.user.id, 'alert_contact_updated');
+  res.json({ ok: true });
+});
+
+app.get('/api/notify/status', mgr, (_req, res) => {
+  const cfg = notify.configured();
+  res.json({
+    configured: cfg,
+    reminder_minutes: Number(getSettings().alert_reminder_minutes) || 0,
+    recipients: notify.recipients().map((r) => ({
+      id: r.id, name: r.name, role: r.role,
+      email_ready: !!(r.alert_email && r.email && cfg.email),
+      sms_ready: !!(r.alert_sms && notify.normalizePhone(r.phone) && cfg.sms),
+      has_email: !!r.email, has_phone: !!notify.normalizePhone(r.phone),
+    })),
+    log: notify.recentLog(15),
+  });
+});
+
+app.post('/api/notify/test', mgr, async (req, res) => {
+  const results = await notify.sendTest(req.user.id);
+  log(req.user.id, 'alert_test_sent');
+  res.json({ results });
 });
 
 app.post('/api/me/password', anyUser, (req, res) => {
@@ -199,7 +235,7 @@ app.get('/uploads/:name', anyUser, (req, res, next) => {
 
 // ---------- users ----------
 const userCols = (viewer) =>
-  'id,name,username,role,phone,active,created_at' + (viewer.role === 'owner' ? ',hourly_rate' : '');
+  'id,name,username,role,phone,active,created_at' + (viewer.role === 'owner' ? ',hourly_rate,email,alert_sms,alert_email' : '');
 
 app.get('/api/users', mgr, (req, res) => {
   res.json(db.prepare(`SELECT ${userCols(req.user)} FROM users ORDER BY active DESC, role, name`).all());
@@ -222,8 +258,9 @@ app.post('/api/users', mgr, (req, res) => {
   if (db.prepare('SELECT 1 FROM users WHERE username=?').get(username)) throw HttpError(409, 'That username is taken');
   const rate = req.user.role === 'owner' ? Math.max(0, num(req.body.hourly_rate) ?? 0) : 0;
   const r = db
-    .prepare('INSERT INTO users (name,username,pass_hash,role,hourly_rate,phone) VALUES (?,?,?,?,?,?)')
-    .run(name, username, bcrypt.hashSync(req.body.password, 10), role, rate, str(req.body.phone, 40));
+    .prepare('INSERT INTO users (name,username,pass_hash,role,hourly_rate,phone,email) VALUES (?,?,?,?,?,?,?)')
+    .run(name, username, bcrypt.hashSync(req.body.password, 10), role, rate, str(req.body.phone, 40),
+      req.user.role === 'owner' && notify.validEmail(str(req.body.email, 200)) ? str(req.body.email, 200) : '');
   log(req.user.id, 'user_created', `${name} (${role})`);
   res.json({ id: Number(r.lastInsertRowid) });
 });
@@ -244,6 +281,13 @@ app.patch('/api/users/:id', mgr, (req, res) => {
   let role = u.role;
   if (isOwner && b.role && u.role !== 'owner' && ['manager', 'employee'].includes(b.role)) role = b.role;
   db.prepare('UPDATE users SET name=?,phone=?,active=?,hourly_rate=?,role=? WHERE id=?').run(name, phone, active, rate, role, id);
+  if (isOwner && b.email !== undefined) {
+    const email = str(b.email, 200);
+    if (email && !notify.validEmail(email)) throw HttpError(400, 'That email address does not look right');
+    db.prepare('UPDATE users SET email=? WHERE id=?').run(email, id);
+  }
+  if (isOwner && b.alert_sms !== undefined) db.prepare('UPDATE users SET alert_sms=? WHERE id=?').run(b.alert_sms ? 1 : 0, id);
+  if (isOwner && b.alert_email !== undefined) db.prepare('UPDATE users SET alert_email=? WHERE id=?').run(b.alert_email ? 1 : 0, id);
   if (b.password) {
     validatePassword(b.password);
     db.prepare('UPDATE users SET pass_hash=? WHERE id=?').run(bcrypt.hashSync(b.password, 10), id);
@@ -1181,7 +1225,10 @@ app.post('/api/incidents', anyUser, (req, res) => {
     req.user.id, category, INCIDENT_CATS[category] ? 1 : 0, roomId && db.prepare('SELECT 1 FROM rooms WHERE id=?').get(roomId) ? roomId : null, description
   );
   log(req.user.id, INCIDENT_CATS[category] ? 'URGENT_incident_reported' : 'incident_reported', `${category}: ${description.slice(0, 80)}`);
-  res.json({ id: Number(r.lastInsertRowid), urgent: INCIDENT_CATS[category] });
+  const incidentId = Number(r.lastInsertRowid);
+  // Sent in the background: the reporter never waits on, or sees a failure from, an SMS or email provider.
+  if (INCIDENT_CATS[category]) notify.notifyIncident(incidentId).catch((e) => console.error('alert failed', e.message));
+  res.json({ id: incidentId, urgent: INCIDENT_CATS[category] });
 });
 
 app.get('/api/incidents', anyUser, (req, res) => {
@@ -1284,6 +1331,11 @@ app.get('/api/dashboard', mgr, (req, res) => {
     `SELECT COUNT(*) c FROM users u WHERE u.active=1 AND u.role<>'owner' AND NOT EXISTS (SELECT 1 FROM acknowledgments a WHERE a.user_id=u.id AND a.version=?)`
   ).get(playbook.VERSION).c;
   if (unsigned) attention.push({ type: 'ack', text: `${unsigned} staff member(s) have not signed the Employee Acknowledgment`, href: '#/team' });
+  const alertCfg = notify.configured();
+  const reachable = notify.recipients().filter((r) => (r.alert_email && r.email && alertCfg.email) || (r.alert_sms && notify.normalizePhone(r.phone) && alertCfg.sms));
+  if (isOwner && !reachable.length) attention.push({ type: 'alerts', text: 'Urgent text/email alerts are NOT set up: nobody would be contacted if an incident is filed', href: '#/settings' });
+  const failed = db.prepare("SELECT COUNT(*) c FROM notifications WHERE status='failed' AND created_at>=?").get(new Date(Date.now() - 86400000).toISOString()).c;
+  if (failed) attention.push({ type: 'alerts', text: `${failed} alert text/email(s) failed to send in the last 24 hours`, href: isOwner ? '#/settings' : '#/account' });
   const openInc = db.prepare("SELECT COUNT(*) c FROM incidents WHERE status='open'").get().c;
   if (openInc) attention.push({ type: 'incident', text: `${openInc} incident report(s) waiting for review`, href: '#/incidents' });
   if (behindCount) attention.push({ type: 'behind', text: `${behindCount} housekeeper(s) behind schedule on a room`, href: '#/home' });
@@ -1374,7 +1426,7 @@ app.put('/api/settings', owner, (req, res) => {
   };
   numSetting('max_break_minutes', 1, 240); numSetting('target_checkout_max', 5, 240); numSetting('target_stayover_max', 5, 240);
   numSetting('target_suite_max', 5, 240); numSetting('behind_factor', 1, 5); numSetting('deep_clean_interval_days', 7, 730);
-  numSetting('pass_rate_target', 1, 100); numSetting('forgotten_clockout_hours', 6, 48);
+  numSetting('pass_rate_target', 1, 100); numSetting('alert_reminder_minutes', 0, 240); numSetting('forgotten_clockout_hours', 6, 48);
   if (b.break_unpaid !== undefined) up.run('break_unpaid', b.break_unpaid ? '1' : '0');
   if (b.require_ack !== undefined) up.run('require_ack', b.require_ack ? '1' : '0');
   log(req.user.id, 'settings_changed');
@@ -1442,8 +1494,9 @@ if (require.main === module) {
   if (process.env.SEED_DEMO === '1') require('./seed-demo')();
   housekeepingJobs();
   setInterval(housekeepingJobs, 3600000).unref();
+  setInterval(() => notify.sendDueReminders().catch((e) => console.error('reminder failed', e.message)), 60000).unref();
   const port = Number(process.env.PORT) || 3000;
   app.listen(port, () => console.log(`Stay Flow running on http://localhost:${port}`));
 }
 
-module.exports = { app, bootstrapOwner };
+module.exports = { app, bootstrapOwner, notify };
